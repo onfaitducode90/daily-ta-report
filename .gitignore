@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+logs/
+daily_ta_report_*.txt
