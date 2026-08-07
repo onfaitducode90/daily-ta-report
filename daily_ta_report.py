@@ -31,6 +31,7 @@ import chart_patterns
 import prediction_log
 import calibrate
 import option_chain
+import iv_history
 
 # Horizon (in trading bars) that pattern confidence is calibrated against
 # for display purposes -- see calibrate.py. An arbitrary but fixed choice;
@@ -2007,6 +2008,19 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
                               if real_iv_context["snapshot_date"] != report_date else "")
                 lines.append(f"Real ATM IV ({real_iv_context['expiration']} exp, "
                               f"{real_iv_context['dte']}d): {iv * 100:.1f}%{ratio_bit}{spread_bit}{stale_bit}")
+
+                # G27: log today's real IV so a genuine IV-rank percentile
+                # can be built over time (see iv_history.py) -- only once
+                # enough daily snapshots exist does real_iv_rank return a
+                # number rather than None, so this is silent for now and
+                # becomes useful as the log accumulates.
+                iv_history.log_iv(ticker, report_date, iv, real_iv_context["expiration"],
+                                   real_iv_context["dte"], real_iv_context["snapshot_date"])
+                real_rank, real_rank_n = iv_history.real_iv_rank(ticker, iv)
+                if real_rank is not None:
+                    lines.append(f"Real IV Rank ({real_rank_n} logged snapshots"
+                                  f"{', still short of a full year' if real_rank_n < iv_history.FULL_LOOKBACK else ''}"
+                                  f"): {real_rank:.0f}%")
 
             if len(df) >= 60:
                 iv_rank = calc_iv_rank(df["Close"], window=30, lookback=252)
