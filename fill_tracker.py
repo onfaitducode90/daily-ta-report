@@ -87,6 +87,23 @@ def log_fill(ticker, report_date, structure, mid_credit, actual_credit, contract
     return row
 
 
+def get_empirical_haircut_fraction(min_fills=20):
+    """Mean slippage as a fraction of mid credit, from real logged fills
+    (H14, 3rd Opus audit) -- e.g. 0.15 means real fills have averaged 15%
+    worse than the mid-based credit a report showed. Returns (fraction,
+    n) where fraction is None until `min_fills` real fills are logged, so
+    daily_ta_report.py's build_credit_spread can fall back to its own
+    modeled haircut (half the combined bid-ask width) until there's
+    enough real data to trust instead of that estimate. 20 is a
+    judgment call, not a statistically-derived minimum -- real fills
+    don't accumulate on any schedule this module controls."""
+    rows = _read_all()
+    pcts = [float(r["slippage_pct_of_mid"]) for r in rows if r.get("slippage_pct_of_mid")]
+    if len(pcts) < min_fills:
+        return None, len(pcts)
+    return (sum(pcts) / len(pcts)) / 100.0, len(pcts)
+
+
 def summarize_fills():
     """Print mean/median slippage across every logged fill -- the actual
     answer to "how optimistic is this tool's mid-based 'verified' number",

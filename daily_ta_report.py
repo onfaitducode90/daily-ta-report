@@ -32,6 +32,7 @@ import prediction_log
 import calibrate
 import option_chain
 import iv_history
+import fill_tracker
 
 # Horizon (in trading bars) that pattern confidence is calibrated against
 # for display purposes -- see calibrate.py. An arbitrary but fixed choice;
@@ -556,16 +557,23 @@ def build_credit_spread(chain, expiration, side, target_short_delta=0.25, target
         return None
     long_q, credit, width, combined_width = best
     # "Fill at mid" is optimistic -- a real entry crosses part of the
-    # spread on at least one leg. haircut_credit assumes you give up HALF
-    # of the combined bid-ask width (i.e. filling roughly at the midpoint
+    # spread on at least one leg. Prefer REAL measured slippage (H14, 3rd
+    # audit) from fill_tracker.py once enough real fills exist; until
+    # then fall back to a modeled haircut assuming you give up HALF of
+    # the combined bid-ask width (i.e. filling roughly at the midpoint
     # between mid and the worse side on each leg, not at the natural mid
-    # on both) -- used for EV purposes alongside the honestly-labeled
+    # on both). Used for EV purposes alongside the honestly-labeled
     # mid-based `credit` shown in the report text.
-    haircut_credit = credit - 0.5 * combined_width
+    empirical_frac, empirical_n = fill_tracker.get_empirical_haircut_fraction()
+    if empirical_frac is not None:
+        haircut_credit = credit * (1 - empirical_frac)
+    else:
+        haircut_credit = credit - 0.5 * combined_width
     return {
         "short_strike": short_q.strike, "long_strike": long_q.strike,
         "credit": credit, "width": width, "max_loss": width - credit,
         "haircut_credit": haircut_credit, "haircut_max_loss": width - haircut_credit,
+        "haircut_source": "measured" if empirical_frac is not None else "modeled",
         "short_delta": getattr(short_q, delta_attr),
         # Real IV at the ACTUAL strike being sold, not the ATM figure the
         # rich/cheap gate above uses -- a 2nd audit noted ATM IV can be far
@@ -1563,6 +1571,32 @@ MIN_CONFLUENCE_WEIGHT = 4.5
 # share of (already rare, post-G5) directional calls from 78% to 25%.
 STRONG_CONFLUENCE_WEIGHT = 6.0
 
+# H17 (3rd Opus audit): the G20 backtest finding -- that this tool's
+# directional calls did not beat buy-and-hold or a 50/200-SMA crossover
+# on the same dates beyond a 1-bar horizon, in either TREND_FAMILY_SIZE
+# configuration (see the comment there for the full numbers) -- previously
+# lived only in that code comment. An audit pointed out that's the most
+# damaging fact in the codebase and it wasn't propagating to the one
+# place a user actually reads: the report itself. Shown next to every
+# directional call this tool makes, not buried where only the source
+# would reveal it.
+BACKTEST_CAVEAT = ("Historical check: in the one backtest run against this tool's confluence logic "
+                    "(NVDA/INTC/SPY/QQQ, 2017-2026, non-independent overlapping-window samples -- see "
+                    "backtest.py), its directional calls did NOT beat simple buy-and-hold or a "
+                    "50/200-SMA crossover on the same dates beyond a 1-bar horizon.")
+
+# H19 (3rd Opus audit): 10% of noise-day directional calls land within
+# +/-0.3 of MIN_CONFLUENCE_WEIGHT -- a genuinely dense knife-edge, not a
+# rare corner case, after PATTERN_FAMILY_COVERAGE=3 quantized the pattern
+# family's contribution into 1.33/2.67/4.00 steps that cluster mass right
+# near the floor. This does NOT change whether total_weight clears the
+# floor -- sufficient_evidence's binary gate, and everything downstream
+# that depends on it (trade structure eligibility, backtest.py's
+# tool_dir), is unchanged -- it only flags in the report text when a
+# verdict landed close enough to the floor that a small data wobble
+# could have gone the other way, on either side of it.
+MARGINAL_BAND = 0.5
+
 
 def compute_confluence(df, pattern_matches):
     """Self-contained confluence computation: given a daily OHLCV history
@@ -2257,24 +2291,32 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
     # opposing signal that exists is now always surfaced.
     oppose_bit = f" Caution: {opposing[0][3]}." if opposing else ""
 
+    near_floor = abs(total_weight - MIN_CONFLUENCE_WEIGHT) <= MARGINAL_BAND
+
     if total_weight == 0:
         net_label = "No clear directional edge"
         bottom_line = "Bottom line: No clear directional edge — no usable signals for this ticker today."
     elif not sufficient_evidence:
         net_label = "Insufficient evidence"
+        marginal_bit = (" This is close to the evidence floor -- a small data change could have "
+                         "flipped it to a directional call." if near_floor else "")
         bottom_line = (f"Bottom line: Insufficient evidence for a directional call — only "
                         f"{support_phrase or 'thin signal coverage'} (total weight {total_weight:.1f}, "
                         f"need {MIN_CONFLUENCE_WEIGHT:.1f}+ from both the trend/momentum and pattern "
-                        "families combined). Treat as no edge.")
+                        f"families combined). Treat as no edge.{marginal_bit}")
     elif abs(net) < 0.15:
         net_label = "Conflicting signals"
         bottom_line = f"Bottom line: Conflicting signals — {support_phrase}.{oppose_bit} Wait for clarity."
     else:
         strength = "confluence" if total_weight >= STRONG_CONFLUENCE_WEIGHT else "lean"
         net_label = f"{'Bullish' if winning_dir > 0 else 'Bearish'} {strength}"
-        bottom_line = (f"Bottom line: {net_label} (total weight {total_weight:.1f}) — "
+        marginal_bit = (" [MARGINAL -- close to the evidence floor; a small data change could flip "
+                         "this back to no edge]" if near_floor else "")
+        bottom_line = (f"Bottom line: {net_label}{marginal_bit} (total weight {total_weight:.1f}) — "
                         f"{support_phrase}.{oppose_bit}")
     lines.append(bottom_line)
+    if net_label.startswith(("Bullish", "Bearish")):
+        lines.append(BACKTEST_CAVEAT)
 
     if has_min_data and trend == "RANGE":
         lines.append("Structure: range-bound — no clean higher-timeframe trend to lean on, "

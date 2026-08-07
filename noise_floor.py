@@ -28,7 +28,7 @@ from datetime import date, datetime
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from scipy.stats import norm
+from scipy.stats import norm, ttest_rel
 
 import daily_ta_report as R
 import chart_patterns as CP
@@ -158,17 +158,55 @@ def bs_price_delta(spot, strike, sigma, years, r, option_type):
     return max(0.0, float(price)), delta
 
 
-def make_synthetic_chain(spot, sigma, dte_days, rng, r=0.04, n_strikes=41):
+def _build_strike_ladder(center_strike, strike_step, n_strikes):
+    """Non-uniform strike spacing -- TIGHT near the money, widening in
+    the wings (real ToS chains commonly go $1 near spot, $2.50, then $5
+    further out) -- not a fixed strike_step everywhere. A 3rd audit
+    (H15) noted a uniform ladder can't exhibit round 2's B3 finding (a
+    live $1 put wing beside a $2 call wing from a spacing change) at all,
+    since every step is identical by construction. Returns a sorted list
+    of distinct positive strikes, roughly n_strikes//2 on each side."""
+    def step_at(distance_in_steps):
+        if distance_in_steps <= 10:
+            return strike_step
+        if distance_in_steps <= 20:
+            return strike_step * 2.5
+        return strike_step * 5
+
+    strikes = {round(center_strike, 2)}
+    for side in (1, -1):
+        cur = center_strike
+        for i in range(1, n_strikes // 2 + 1):
+            cur += side * step_at(i)
+            if cur > 0:
+                strikes.add(round(cur, 2))
+    return sorted(strikes)
+
+
+def make_synthetic_chain(spot, sigma, dte_days, rng, r=0.04, n_strikes=41, skew_slope=0.25):
     """A synthetic OptionChain (real option_chain.py dataclasses, so
     build_credit_spread runs completely unmodified against it) with
     Black-Scholes prices/deltas, a modeled bid-ask spread that widens
-    (relatively) for cheaper/further-OTM contracts, and open interest that
-    decays with distance from the money -- so the liquidity/width filters
-    in build_credit_spread get genuinely exercised, not just the delta
-    targeting."""
+    (relatively) for cheaper/further-OTM contracts, open interest that
+    decays with distance from the money, a NON-UNIFORM strike ladder, and
+    volatility SKEW (H15, 3rd audit: a flat vol surface means every
+    strike is fair-priced relative to every other by construction, so no
+    strike-selection rule could ever beat any other EVEN IN PRINCIPLE --
+    that's a much more fundamental limitation than the self-referential
+    P(win)-model point G29 already made). skew_slope=0.25 gives OTM puts
+    richer IV than OTM calls, the typical equity/index shape -- puts
+    ~sigma*(1+0.25*ln(spot/K)) rich, calls the mirror image."""
     strike_step = max(0.5, round(spot * 0.01, 1))
     years = dte_days / 365.0
     center_strike = round(spot / strike_step) * strike_step
+    strikes = _build_strike_ladder(center_strike, strike_step, n_strikes)
+
+    def skewed_sigma(strike):
+        # ln(spot/strike) > 0 below spot (OTM puts), < 0 above (OTM calls)
+        # -- richer downside, cheaper upside, the standard equity skew
+        # shape. Floored well above zero so deep-wing strikes can't be
+        # pushed to a degenerate/negative vol by a large log-moneyness.
+        return max(0.05, sigma * (1 + skew_slope * np.log(spot / strike)))
 
     def spread_for(mid):
         # Tuned to keep a realistic-but-not-dominant rejection rate under
@@ -180,12 +218,10 @@ def make_synthetic_chain(spot, sigma, dte_days, rng, r=0.04, n_strikes=41):
         return max(0.01, mid - half), mid + half
 
     quotes = []
-    for i in range(-(n_strikes // 2), n_strikes // 2 + 1):
-        strike = round(center_strike + i * strike_step, 2)
-        if strike <= 0:
-            continue
-        call_mid, call_delta = bs_price_delta(spot, strike, sigma, years, r, "call")
-        put_mid, put_delta = bs_price_delta(spot, strike, sigma, years, r, "put")
+    for strike in strikes:
+        strike_sigma = skewed_sigma(strike)
+        call_mid, call_delta = bs_price_delta(spot, strike, strike_sigma, years, r, "call")
+        put_mid, put_delta = bs_price_delta(spot, strike, strike_sigma, years, r, "put")
         call_bid, call_ask = spread_for(call_mid)
         put_bid, put_ask = spread_for(put_mid)
         dist = abs(strike - spot) / spot
@@ -195,10 +231,10 @@ def make_synthetic_chain(spot, sigma, dte_days, rng, r=0.04, n_strikes=41):
         quotes.append(OC.OptionQuote(
             expiration=SYNTH_EXP, days_to_expiration=dte_days, strike=strike,
             call_bid=round(call_bid, 2), call_ask=round(call_ask, 2),
-            call_iv=sigma, call_delta=round(call_delta, 4),
+            call_iv=strike_sigma, call_delta=round(call_delta, 4),
             call_volume=int(call_oi * 0.1), call_open_interest=call_oi,
             put_bid=round(put_bid, 2), put_ask=round(put_ask, 2),
-            put_iv=sigma, put_delta=round(put_delta, 4),
+            put_iv=strike_sigma, put_delta=round(put_delta, 4),
             put_volume=int(put_oi * 0.1), put_open_interest=put_oi,
         ))
     return OC.OptionChain(
@@ -235,15 +271,32 @@ def spread_dte(chain):
     return chain.quotes[0].days_to_expiration if chain.quotes else None
 
 
-def run_strike_selection_comparison(n_trials=1000, target_delta=0.25, jitter=0.05, seed=7):
+def run_strike_selection_comparison(n_trials=1000, target_delta=0.25, jitter=0.15, seed=7):
     """Tool's EXACT target (0.25 delta, this codebase's actual default)
     vs. a RANDOM target uniformly drawn from the same +/-jitter neighborhood
     each trial -- both run through the identical build_credit_spread code
-    path and identical filters, so this isolates whether hitting the exact
-    target delta matters, not whether the algorithm or filters differ."""
+    path and identical filters against the SAME synthetic chain, so this
+    isolates whether hitting the exact target delta matters, not whether
+    the algorithm, filters, or market conditions differ.
+
+    PAIRED by trial (H16, 3rd audit): an earlier version compared the
+    mean of whichever trials the tool happened to succeed on against the
+    mean of whichever (PARTIALLY DIFFERENT) trials random happened to
+    succeed on -- mixing a selection effect (which trials survived each
+    arm's guards) into the treatment effect (targeting precision). This
+    keeps only trials where BOTH arms produced a valid structure and runs
+    a paired t-test on the per-trial EV difference.
+
+    jitter=0.15 (was 0.05, exactly equal to DELTA_TOLERANCE_PCT's implied
+    +/-0.05 band at this target): at jitter==tolerance, the random arm's
+    target already sits inside the SAME acceptance band the tool itself
+    uses, so a large share of pairs pick the literal same strike -- not a
+    meaningfully different "random" comparison. 0.15 gives real
+    separation while still being a plausible "somewhere in the right
+    neighborhood" assumption, not an unreasonable one."""
     rng = np.random.default_rng(seed)
-    tool_results, random_results = [], []
-    tool_none, random_none = 0, 0
+    paired_tool, paired_random = [], []
+    tool_only_none, random_only_none, both_none = 0, 0, 0
 
     for _ in range(n_trials):
         spot = float(rng.uniform(20, 500))
@@ -256,52 +309,53 @@ def run_strike_selection_comparison(n_trials=1000, target_delta=0.25, jitter=0.0
         random_target = float(np.clip(rng.uniform(target_delta - jitter, target_delta + jitter), 0.01, 0.99))
         rand = credit_structure_quality(chain, side, random_target)
 
-        if tool is None:
-            tool_none += 1
+        if tool is not None and rand is not None:
+            paired_tool.append(tool)
+            paired_random.append(rand)
+        elif tool is None and rand is None:
+            both_none += 1
+        elif tool is None:
+            tool_only_none += 1
         else:
-            tool_results.append(tool)
-        if rand is None:
-            random_none += 1
-        else:
-            random_results.append(rand)
+            random_only_none += 1
 
+    n_paired = len(paired_tool)
     print(f"\n=== G29: exact-delta-target ({target_delta}) vs. random target in "
-          f"[{target_delta - jitter:.2f}, {target_delta + jitter:.2f}] -- n={n_trials} synthetic BS chains ===")
-    print(f"  Tool:   {len(tool_results)}/{n_trials} produced a valid structure "
-          f"({tool_none} rejected by delta/liquidity/width guards)")
-    print(f"  Random: {len(random_results)}/{n_trials} produced a valid structure "
-          f"({random_none} rejected)")
+          f"[{target_delta - jitter:.2f}, {target_delta + jitter:.2f}] -- n={n_trials} synthetic BS chains "
+          "(skewed vol, non-uniform strike ladder) ===")
+    print(f"  Paired (both arms valid): {n_paired}/{n_trials}. "
+          f"Tool-only rejected: {tool_only_none}, random-only rejected: {random_only_none}, "
+          f"both rejected: {both_none}.")
 
-    for label, results in (("Tool (exact 0.25 target)", tool_results),
-                            ("Random (jittered target)", random_results)):
-        if not results:
-            continue
-        ev = np.array([r["ev_net"] for r in results])
-        ratio = np.array([r["ratio"] for r in results])
-        delta_err = np.array([abs(r["achieved_delta"] - target_delta) for r in results])
-        print(f"  {label}: mean EV/contract=${ev.mean():+.2f} (median ${np.median(ev):+.2f}), "
-              f"mean credit/width={ratio.mean():.2f}, mean |delta err|={delta_err.mean():.3f}")
+    if n_paired < 10:
+        print("  Too few paired trials to test -- widen jitter or increase n_trials.")
+        return
 
-    if tool_results and random_results:
-        ev_tool = np.array([r["ev_net"] for r in tool_results])
-        ev_rand = np.array([r["ev_net"] for r in random_results])
-        print(f"  EV difference (tool - random, on their own respective valid subsets): "
-              f"${ev_tool.mean() - ev_rand.mean():+.2f}/contract")
-        print("  (Same underlying EV MODEL judges both -- P(win) is derived from whichever delta was "
-              "actually picked, so this measures whether targeting precision changes the OUTCOME, not "
-              "just whether it changes which strike gets picked.)")
-        # Last measured (n=1000): tool $-6.84 vs random $-6.85, a $0.00
-        # difference -- exact delta targeting buys essentially nothing on
-        # THIS metric. That's not a bug in the targeting logic; it's a
-        # property of judging both structures by the same delta-implied
-        # P(win) model -- of course a structure looks about as "good" as
-        # whatever delta it landed on, regardless of whether that delta
-        # was hit precisely or approximately. What precise targeting DOES
-        # buy, that this test doesn't measure, is a more PREDICTABLE risk
-        # profile (the trader asked for a 25-delta short and reliably gets
-        # one, rather than something in a 20-30 delta band) -- consistency
-        # of the resulting structure, not a better EV estimate under this
-        # tool's own simplified probability model.
+    ev_tool = np.array([r["ev_net"] for r in paired_tool])
+    ev_rand = np.array([r["ev_net"] for r in paired_random])
+    ratio_tool = np.array([r["ratio"] for r in paired_tool])
+    ratio_rand = np.array([r["ratio"] for r in paired_random])
+    delta_err_tool = np.array([abs(r["achieved_delta"] - target_delta) for r in paired_tool])
+    delta_err_rand = np.array([abs(r["achieved_delta"] - target_delta) for r in paired_random])
+
+    print(f"  Tool   (exact {target_delta} target): mean EV/contract=${ev_tool.mean():+.2f}, "
+          f"mean credit/width={ratio_tool.mean():.2f}, mean |delta err|={delta_err_tool.mean():.3f} "
+          f"(sd {delta_err_tool.std():.3f})")
+    print(f"  Random (jittered target):        mean EV/contract=${ev_rand.mean():+.2f}, "
+          f"mean credit/width={ratio_rand.mean():.2f}, mean |delta err|={delta_err_rand.mean():.3f} "
+          f"(sd {delta_err_rand.std():.3f})")
+
+    diff = ev_tool - ev_rand
+    t_stat, p_value = ttest_rel(ev_tool, ev_rand)
+    print(f"  Paired EV difference (tool - random): ${diff.mean():+.3f}/contract "
+          f"(paired t-test: t={t_stat:.2f}, p={p_value:.3f}, n={n_paired})")
+    print("  (Same underlying EV MODEL judges both -- P(win) is derived from whichever delta was "
+          "actually picked, so this measures whether targeting precision changes the OUTCOME, not "
+          "just whether it changes which strike gets picked.)")
+    print(f"  Delta-precision gap: random's achieved-delta error has "
+          f"{delta_err_rand.std() / max(delta_err_tool.std(), 1e-9):.1f}x the spread of the tool's -- THIS is "
+          "what precise targeting actually buys: a predictable risk profile, not (per the p-value above) "
+          "a better EV estimate under this tool's own model.")
 
 
 def main():
