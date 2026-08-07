@@ -372,10 +372,17 @@ def fetch_real_iv_context(ticker, hv30_val, report_date, min_days=5, max_age_day
     if iv is None:
         return None
     dte = (expiration - report_date).days
+    # A RATIO (iv_ratio), not the raw point spread (iv_minus_hv, kept for
+    # display/backward compat) -- a 2nd audit noted the point spread isn't
+    # scale-invariant: 5 points on a 15%-IV name is a 33% premium, 5
+    # points on a 95%-IV name (SPCX) is barely 5%. iv_ratio makes "rich"
+    # mean the same thing regardless of the name's baseline vol level.
+    iv_ratio = (iv / hv30_val) if hv30_val is not None and hv30_val > 0 else None
     return {
         "chain": chain, "expiration": expiration, "dte": dte, "iv": iv,
         "snapshot_date": snapshot_date,
         "iv_minus_hv": (iv - hv30_val) if hv30_val is not None else None,
+        "iv_ratio": iv_ratio,
     }
 
 
@@ -402,10 +409,10 @@ def build_credit_spread(chain, expiration, side, target_short_delta=0.25):
         checking before)."""
     quotes = sorted(chain.for_expiration(expiration), key=lambda q: q.strike)
     if side == "put":
-        delta_attr, mid_attr = "put_delta", "put_mid"
+        delta_attr, mid_attr, iv_attr = "put_delta", "put_mid", "put_iv"
         bid_attr, ask_attr, oi_attr = "put_bid", "put_ask", "put_open_interest"
     elif side == "call":
-        delta_attr, mid_attr = "call_delta", "call_mid"
+        delta_attr, mid_attr, iv_attr = "call_delta", "call_mid", "call_iv"
         bid_attr, ask_attr, oi_attr = "call_bid", "call_ask", "call_open_interest"
     else:
         raise ValueError(f"side must be 'put' or 'call', got {side!r}")
@@ -446,6 +453,12 @@ def build_credit_spread(chain, expiration, side, target_short_delta=0.25):
         "short_strike": short_q.strike, "long_strike": long_q.strike,
         "credit": credit, "width": width, "max_loss": width - credit,
         "short_delta": getattr(short_q, delta_attr),
+        # Real IV at the ACTUAL strike being sold, not the ATM figure the
+        # rich/cheap gate above uses -- a 2nd audit noted ATM IV can be far
+        # from OTM IV on a skewed name, so "rich ATM" says little about
+        # whether this specific strike is rich. None if this expiration's
+        # export didn't have it (e.g. "--"/"<empty>" on a thin strike).
+        "short_iv": getattr(short_q, iv_attr),
     }
 
 
@@ -855,14 +868,31 @@ def calc_intraday_poc_bins(intraday_df, min_bins=20, max_bins=40):
     return int(min(max(round(price_range / median_bar_range), min_bins), max_bins))
 
 
-def calc_beta_correlation(ticker_df, spy_df, window=63):
-    """Rolling correlation and beta of this ticker's daily returns against
-    SPY's, over the trailing `window` (default ~1 quarter) trading days
-    both series actually have in common. Distinguishes an idiosyncratic,
+def calc_beta_correlation(ticker_df, spy_df, window=126, recent_window=63):
+    """Beta and correlation of this ticker's daily returns against SPY's,
+    via OLS (scipy.stats.linregress, which also hands back the slope's
+    standard error for free) over the trailing `window` trading days both
+    series actually have in common. Distinguishes an idiosyncratic,
     name-specific move from a market-wide one riding on the same tape
-    (Opus audit F32) -- a high-|correlation| bullish/bearish read is more
-    "long/short the market" than "long/short this name". Returns None if
-    either series is missing or there isn't enough overlapping history."""
+    (Opus audit F32).
+
+    A 2nd audit simulated this at a KNOWN true beta and found the
+    original 63-day window's beta estimate for a high-idiosyncratic-vol
+    name (sigma 5.5%/day, e.g. SPCX) had a standard deviation of 0.81
+    around a true beta of 1.6 -- a 95% range of roughly [0.12, 3.07],
+    i.e. close to uninformative -- while the SAME window's correlation
+    averaged only 0.24, because high idiosyncratic vol mechanically
+    suppresses correlation without reducing market exposure at all.
+    Doubling the window to 126 days cut that beta sd roughly in half in
+    the same simulation. window=60 is this function's hard floor (below
+    that, returns None rather than print a number the audit's own
+    simulation showed was closer to noise than signal); `recent_window`
+    is a secondary, faster-moving read of the same relationship, kept
+    separate so a regime change shows up without discarding the more
+    stable primary estimate.
+
+    Returns None if either series is missing or there isn't enough
+    overlapping history for the primary window."""
     if ticker_df is None or spy_df is None:
         return None
     t_ret = ticker_df["Close"].pct_change().dropna()
@@ -872,16 +902,27 @@ def calc_beta_correlation(ticker_df, spy_df, window=63):
     joined = pd.concat([t_ret, s_ret], axis=1, join="inner").tail(window)
     joined.columns = ["ticker", "spy"]
     joined = joined.dropna()
-    if len(joined) < 20:
+    if len(joined) < 60:
         return None
-    corr = joined["ticker"].corr(joined["spy"])
-    var_spy = joined["spy"].var()
-    if not var_spy or np.isnan(var_spy):
+
+    reg = scipy_stats.linregress(joined["spy"].values, joined["ticker"].values)
+    if np.isnan(reg.slope) or np.isnan(reg.rvalue):
         return None
-    beta = joined["ticker"].cov(joined["spy"]) / var_spy
-    if np.isnan(corr) or np.isnan(beta):
-        return None
-    return {"correlation": float(corr), "beta": float(beta), "n": len(joined)}
+
+    result = {
+        "beta": float(reg.slope), "beta_stderr": float(reg.stderr),
+        "correlation": float(reg.rvalue), "n": len(joined),
+    }
+
+    recent = joined.tail(recent_window)
+    if len(recent) >= 20:
+        reg_r = scipy_stats.linregress(recent["spy"].values, recent["ticker"].values)
+        if not (np.isnan(reg_r.slope) or np.isnan(reg_r.rvalue)):
+            result["recent_beta"] = float(reg_r.slope)
+            result["recent_correlation"] = float(reg_r.rvalue)
+            result["recent_n"] = len(recent)
+
+    return result
 
 
 def calc_hv(close, window=30, annualize=252):
@@ -1129,14 +1170,20 @@ def build_portfolio_section(portfolio_infos):
                  f"{len(bullish)} bullish, {len(bearish)} bearish, {len(no_edge)} no clear edge.")
 
     def spy_corr_bit(group):
-        known = [p for p in group if p.get("spy_correlation") is not None]
+        # Driven by BETA (real market exposure), not correlation -- see
+        # calc_beta_correlation's docstring: correlation is suppressed by
+        # idiosyncratic vol even when beta (actual market exposure) is
+        # high, so using correlation here made the same "independent of
+        # the market" mistake this fix corrects in the per-ticker line.
+        known = [p for p in group if p.get("spy_beta") is not None]
         if not known:
             return ""
-        corr_text = ", ".join(f"{p['ticker']} {p['spy_correlation']:+.2f}" for p in known)
-        avg_abs = np.mean([abs(p["spy_correlation"]) for p in known])
-        market_bit = (" -- mostly market beta, not independent ideas" if avg_abs > 0.6
-                       else " -- more idiosyncratic than a pure market bet" if avg_abs < 0.3 else "")
-        return f" vs-SPY correlation: {corr_text}{market_bit}."
+        beta_text = ", ".join(f"{p['ticker']} beta {p['spy_beta']:+.2f}" for p in known)
+        avg_abs_beta = np.mean([abs(p["spy_beta"]) for p in known])
+        market_bit = (" -- high market exposure across these names, not independent ideas" if avg_abs_beta > 1.5
+                       else " -- low market exposure, more idiosyncratic than a pure market bet" if avg_abs_beta < 0.5
+                       else "")
+        return f" vs-SPY beta: {beta_text}{market_bit}."
 
     flagged = False
     if len(bullish) >= 2:
@@ -1319,6 +1366,18 @@ PATTERN_FAMILY_COVERAGE = 3
 # to agree (partially or fully) -- one family voting alone, however
 # lopsided, can never clear this floor by construction.
 MIN_CONFLUENCE_WEIGHT = 4.5
+# With only 2 families, `net` is close to degenerate: a 2nd audit measured
+# 68% of directional calls landing at EXACTLY net=+/-1.00 (both families
+# simply agreeing), which happens identically whether total_weight is
+# barely over MIN_CONFLUENCE_WEIGHT or twice that -- net's magnitude
+# stopped carrying strength information the moment sufficient_evidence
+# was true. total_weight is the number that actually varies with how much
+# evidence exists (max possible with 2 families at FAMILY_WEIGHT_CAP each
+# is 8.0), so the "confluence" vs. "lean" strength label -- and the
+# reference number shown alongside it -- is now driven by total_weight,
+# not net. Measured on pure noise: this drops the "confluence" label's
+# share of (already rare, post-G5) directional calls from 78% to 25%.
+STRONG_CONFLUENCE_WEIGHT = 6.0
 
 
 def compute_confluence(df, pattern_matches):
@@ -1526,17 +1585,39 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
 
     beta_ctx = calc_beta_correlation(df, spy_df)
     if beta_ctx is not None:
-        abs_corr = abs(beta_ctx["correlation"])
-        if abs_corr > 0.7:
-            read = "tightly tracking the broad market -- today's setup may be more a leveraged market bet than a name-specific edge"
-        elif abs_corr > 0.3:
-            read = "loosely correlated with the broad market -- part market, part name-specific"
+        beta, corr, se = beta_ctx["beta"], beta_ctx["correlation"], beta_ctx["beta_stderr"]
+        ci_lo, ci_hi = beta - 1.96 * se, beta + 1.96 * se
+        abs_beta, abs_corr = abs(beta), abs(corr)
+        # Market-exposure language is driven by BETA, not correlation --
+        # a 2nd audit caught the previous correlation-only framing getting
+        # this backwards for high-idiosyncratic-vol names: high idiosyncratic
+        # vol mechanically suppresses correlation while leaving actual market
+        # exposure (beta) untouched, so a name with real leverage to the
+        # market but a noisy day-to-day relationship was being called
+        # "independent of the market". Correlation now only describes how
+        # much to trust the beta NUMBER, not whether market exposure exists.
+        if abs_beta > 1.5:
+            exposure = ("high market exposure -- today's setup may be more a leveraged "
+                        "market bet than a name-specific edge")
+        elif abs_beta > 0.5:
+            exposure = "roughly market-level exposure"
         else:
-            read = "largely independent of the broad market right now -- more idiosyncratic than a pure market bet"
-        lines.append(f"vs SPY ({beta_ctx['n']}d): correlation {beta_ctx['correlation']:+.2f}, "
-                      f"beta {beta_ctx['beta']:.2f} — {ticker} is {read}.")
+            exposure = "low market exposure -- moves here look more idiosyncratic than market-driven"
+        if abs_corr > 0.6:
+            reliability = "a reasonably reliable beta read"
+        elif abs_corr > 0.3:
+            reliability = "a noisy beta read -- don't over-read the exact number"
+        else:
+            reliability = ("a very noisy beta read -- low correlation to SPY means this could be "
+                            "mostly idiosyncratic-vol noise rather than a precise market-exposure estimate")
+        lines.append(f"vs SPY ({beta_ctx['n']}d): beta {beta:+.2f} (95% CI {ci_lo:+.2f} to {ci_hi:+.2f}), "
+                      f"correlation {corr:+.2f} — {ticker} shows {exposure}; correlation suggests {reliability}.")
+        if "recent_beta" in beta_ctx:
+            lines.append(f"  Recent ({beta_ctx['recent_n']}d, faster-moving) beta: {beta_ctx['recent_beta']:+.2f}, "
+                          f"correlation {beta_ctx['recent_correlation']:+.2f} -- a large gap from the figure "
+                          "above would suggest a recent shift in how this name trades vs. the market.")
     else:
-        lines.append("vs SPY: Insufficient overlapping history to compute correlation/beta.")
+        lines.append("vs SPY: Insufficient overlapping history (need 60+ days) to compute a beta/correlation read.")
 
     # ---------------- SECTION 3: Key Technical Zones ----------------
     lines.append("")
@@ -1900,11 +1981,13 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
             if real_iv_context is not None:
                 iv = real_iv_context["iv"]
                 spread = real_iv_context["iv_minus_hv"]
-                spread_bit = f", IV-HV spread {spread * 100:+.1f} pts" if spread is not None else ""
+                ratio = real_iv_context["iv_ratio"]
+                ratio_bit = f", IV/HV ratio {ratio:.2f}x" if ratio is not None else ""
+                spread_bit = f" ({spread * 100:+.1f} pts)" if spread is not None else ""
                 stale_bit = (" [snapshot from a prior day]"
                               if real_iv_context["snapshot_date"] != report_date else "")
                 lines.append(f"Real ATM IV ({real_iv_context['expiration']} exp, "
-                              f"{real_iv_context['dte']}d): {iv * 100:.1f}%{spread_bit}{stale_bit}")
+                              f"{real_iv_context['dte']}d): {iv * 100:.1f}%{ratio_bit}{spread_bit}{stale_bit}")
 
             if len(df) >= 60:
                 iv_rank = calc_iv_rank(df["Close"], window=30, lookback=252)
@@ -1990,9 +2073,10 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
         net_label = "Conflicting signals"
         bottom_line = f"Bottom line: Conflicting signals — {support_phrase}.{oppose_bit} Wait for clarity."
     else:
-        strength = "confluence" if abs(net) >= 0.75 else "lean"
+        strength = "confluence" if total_weight >= STRONG_CONFLUENCE_WEIGHT else "lean"
         net_label = f"{'Bullish' if winning_dir > 0 else 'Bearish'} {strength}"
-        bottom_line = f"Bottom line: {net_label} — {support_phrase}.{oppose_bit}"
+        bottom_line = (f"Bottom line: {net_label} (total weight {total_weight:.1f}) — "
+                        f"{support_phrase}.{oppose_bit}")
     lines.append(bottom_line)
 
     if has_min_data and trend == "RANGE":
@@ -2073,13 +2157,18 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
     # not what the market is pricing, and have already been caught
     # disagreeing with a real chain (SPCX showed HV-percentile "Elevated"
     # while real IV was routinely rich a different amount than that implied).
-    if real_iv_context is not None and real_iv_context["iv_minus_hv"] is not None:
-        iv_spread = real_iv_context["iv_minus_hv"]
-        # 5 vol points of real IV over realized vol = a real premium --
-        # roughly matches the old HV30>50% fallback's selectivity without
-        # being tied to an arbitrary absolute HV level.
-        iv_high = iv_spread > 0.05
-        iv_low = iv_spread < -0.05
+    if real_iv_context is not None and real_iv_context["iv_ratio"] is not None:
+        iv_ratio = real_iv_context["iv_ratio"]
+        # A RATIO, not the raw point spread -- a 2nd audit noted the point
+        # spread isn't scale-invariant: 5 points on a 15%-IV name is a 33%
+        # relative premium, 5 points on SPCX's 95% IV is barely 5%. 1.15x
+        # is inside the audit's suggested 1.15-1.25x "rich" range (chosen
+        # at the inclusive end deliberately: SPCX's own live ratio sits at
+        # ~1.19x, and this tool has already relied on catching that case).
+        IV_RICH_RATIO = 1.15
+        IV_CHEAP_RATIO = 1 / IV_RICH_RATIO  # ~0.87x, symmetric in log-space
+        iv_high = iv_ratio > IV_RICH_RATIO
+        iv_low = iv_ratio < IV_CHEAP_RATIO
         iv_rich_fallback = False
     else:
         iv_high = iv_rank is not None and iv_rank > 50
@@ -2138,24 +2227,30 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
     # SOME signal, independent of whether the evidence floor was cleared
     # -- a 2nd audit caught this printing "Insufficient evidence (net
     # +1.00)" live, which reads as high confidence right next to a "no
-    # edge" verdict. Only show net once it's actually backed by
-    # sufficient_evidence; show total_weight instead otherwise, which is
-    # the number that actually explains why the verdict is what it is.
-    net_bit = f"(net {net:+.2f})" if sufficient_evidence else f"(total weight {total_weight:.1f})"
+    # edge" verdict. Worse, with only 2 confluence families net is close
+    # to degenerate even when evidence IS sufficient (68% of directional
+    # calls land at exactly +/-1.00 the moment both families simply
+    # agree, regardless of whether total_weight is barely over the floor
+    # or twice that) -- so total_weight, not net, is always the headline
+    # number here. net is still shown alongside once there's sufficient
+    # evidence, since it does carry real information in the case the two
+    # families partially disagree (net isn't +/-1.00 there).
+    net_bit = (f"(total weight {total_weight:.1f}, net {net:+.2f})" if sufficient_evidence
+               else f"(total weight {total_weight:.1f})")
     lines.append(f"Directional bias: {net_label} {net_bit}")
 
-    if real_iv_context is not None and real_iv_context["iv_minus_hv"] is not None:
+    if real_iv_context is not None and real_iv_context["iv_ratio"] is not None:
         iv_pct = real_iv_context["iv"] * 100
-        spread_pct = real_iv_context["iv_minus_hv"] * 100
+        ratio = real_iv_context["iv_ratio"]
         exp_bit = f"{real_iv_context['expiration']} exp"
         if iv_high:
-            vol_text = (f"Real ATM IV {iv_pct:.0f}% ({exp_bit}) is {spread_pct:+.1f} pts over HV30 "
+            vol_text = (f"Real ATM IV {iv_pct:.0f}% ({exp_bit}) is {ratio:.2f}x HV30 "
                         f"— premium genuinely rich, per the {real_iv_context['snapshot_date']} chain snapshot")
         elif iv_low:
-            vol_text = (f"Real ATM IV {iv_pct:.0f}% ({exp_bit}) is {spread_pct:.1f} pts under HV30 "
+            vol_text = (f"Real ATM IV {iv_pct:.0f}% ({exp_bit}) is only {ratio:.2f}x HV30 "
                         "— premium not rich; selling here has little edge")
         else:
-            vol_text = (f"Real ATM IV {iv_pct:.0f}% ({exp_bit}) roughly matches HV30 ({spread_pct:+.1f} pts) "
+            vol_text = (f"Real ATM IV {iv_pct:.0f}% ({exp_bit}) roughly matches HV30 ({ratio:.2f}x) "
                         "— no clear edge buying or selling premium")
     elif iv_high:
         vol_text = f"Elevated IV rank ({iv_rank:.0f}%) — premium may be rich; verify against a real chain"
@@ -2281,7 +2376,10 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
             spread = build_credit_spread(chain, expiration, "put", target_short_delta=0.25)
             if spread is not None and spread["max_loss"] > 0:
                 rr_credit = spread["credit"] / spread["max_loss"]
-                delta_bit = f" (short delta {spread['short_delta']:.2f})" if spread["short_delta"] is not None else ""
+                delta_bit = f" (short delta {spread['short_delta']:.2f}" if spread["short_delta"] is not None else ""
+                if delta_bit and spread["short_iv"] is not None:
+                    delta_bit += f", short-strike IV {spread['short_iv'] * 100:.0f}%"
+                delta_bit += ")" if delta_bit else ""
                 lines.append(f"Bull Put Spread ({chain_bit}): "
                               f"sell {fmt_price(spread['short_strike'])}P / buy {fmt_price(spread['long_strike'])}P "
                               f"— credit {fmt_price(spread['credit'])}, width {fmt_price(spread['width'])}, "
@@ -2319,7 +2417,10 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
             spread = build_credit_spread(chain, expiration, "call", target_short_delta=0.25)
             if spread is not None and spread["max_loss"] > 0:
                 rr_credit = spread["credit"] / spread["max_loss"]
-                delta_bit = f" (short delta {spread['short_delta']:.2f})" if spread["short_delta"] is not None else ""
+                delta_bit = f" (short delta {spread['short_delta']:.2f}" if spread["short_delta"] is not None else ""
+                if delta_bit and spread["short_iv"] is not None:
+                    delta_bit += f", short-strike IV {spread['short_iv'] * 100:.0f}%"
+                delta_bit += ")" if delta_bit else ""
                 lines.append(f"Bear Call Spread ({chain_bit}): "
                               f"sell {fmt_price(spread['short_strike'])}C / buy {fmt_price(spread['long_strike'])}C "
                               f"— credit {fmt_price(spread['credit'])}, width {fmt_price(spread['width'])}, "
@@ -2341,8 +2442,12 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
                 max_loss = total_width - total_credit
                 delta_bit = ""
                 if put_spread["short_delta"] is not None and call_spread["short_delta"] is not None:
+                    iv_bit = ""
+                    if put_spread["short_iv"] is not None and call_spread["short_iv"] is not None:
+                        iv_bit = (f", short-strike IV {put_spread['short_iv'] * 100:.0f}%P / "
+                                  f"{call_spread['short_iv'] * 100:.0f}%C")
                     delta_bit = (f" (short deltas {put_spread['short_delta']:.2f}P / "
-                                  f"{call_spread['short_delta']:.2f}C)")
+                                  f"{call_spread['short_delta']:.2f}C{iv_bit})")
                 if max_loss > 0:
                     rr_bit = f", R:R {total_credit / max_loss:.2f}:1"
                     lines.append(f"Iron Condor ({chain_bit}): "
@@ -2400,6 +2505,7 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
         "vol_stance": vol_stance,
         "earnings_soon": days_to_earnings is not None and 0 <= days_to_earnings <= 7,
         "spy_correlation": beta_ctx["correlation"] if beta_ctx is not None else None,
+        "spy_beta": beta_ctx["beta"] if beta_ctx is not None else None,
     }
 
     return "\n".join(lines), portfolio_info

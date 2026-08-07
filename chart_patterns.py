@@ -523,7 +523,23 @@ def _build_pt_match(name, bias, shape_diff, neckline_diff, extreme_price, neckli
     if pullback_depth is None:
         pullback_depth = abs(extreme_price - neckline) / max(atr_val, 1e-9)
     depth_score = min(pullback_depth / 3.0, 1.0)
-    confidence = round(((shape_score + neckline_score + depth_score) / 3) * 100, 1)
+    # MULTIPLICATIVE in shape/neckline fit, not a flat 3-way average -- a
+    # 2nd audit measured this engine's "Strong" (>=75) rate at 50.0% on
+    # pure noise vs. the trendline engine's 29.5% after ITS confidence was
+    # made multiplicative (F22), because this one was still an additive
+    # blend on a different, ungated scale under the same shared 55/75
+    # tier cutoffs. shape_score and neckline_score are this pattern's
+    # actual geometric-fit measures (how tight the shoulders/necklines
+    # match, the peak/trough equivalent of the trendline engine's r^2) --
+    # letting a good depth_score alone offset a mediocre shape/neckline
+    # match, as the plain average did, is the same failure mode F22 fixed
+    # elsewhere. depth_score modulates within a 0.5-1.0 range instead of
+    # 0-1 so a shallow-but-otherwise-clean pattern isn't crushed toward
+    # zero by one weak secondary factor -- the same half-floored blend
+    # already used for the trendline ensemble's agreement-rate scaling.
+    fit_score = (shape_score + neckline_score) / 2
+    other_factors = 0.5 + 0.5 * depth_score
+    confidence = round(fit_score * other_factors * 100, 1)
 
     height = abs(extreme_price - neckline)
     buffer = 0.25 * atr_val
@@ -693,7 +709,14 @@ def detect_rounded_pattern(df, window=40):
     atr_val = float(calc_atr(df, 14).iloc[-1])
     atr_val = atr_val if not np.isnan(atr_val) else 0.0
     buffer = 0.25 * atr_val
-    confidence = round(min(r2, 1.0) * 100, 1)
+    # r2>=0.5 is required just to reach this line (the gate above), so
+    # confidence=r2*100 directly had a hard floor of 50 -- this pattern
+    # could never be "Weak" and could never be caught by
+    # CONFIDENCE_FLOOR=40, no matter how marginal the fit (a 2nd audit
+    # caught this). Rescale the only valid range [0.5, 1.0] to [0, 100]
+    # instead, so a fit that barely clears the gate reads as barely
+    # confident, not as an automatic 50%.
+    confidence = round(max(0.0, min((r2 - 0.5) / 0.5, 1.0)) * 100, 1)
 
     if a < 0:
         name, bias = "Rounded Top", "Bearish"

@@ -255,15 +255,57 @@ def test_noise_false_positive_rate(n_trials=200):
     print(f"  [noise n={n_trials}] patterns/report={patterns_per_report:.2f}, "
           f"mean confidence={mean_confidence:.1f}%, false confluence rate={false_confluence_rate:.1%}")
 
-    # Last verified: 1.90 patterns/report (400 trials, post-F22/F24/F25) -- margin to 2.5.
+    # Last verified: 1.75 patterns/report (200 trials, post-G5/G21 pattern-family
+    # coverage scaling + peak/trough & rounded engine rescaling) -- margin to 2.5.
     check(f"Noise patterns/report stays below 2.5 (got {patterns_per_report:.2f})",
           patterns_per_report < 2.5)
-    # Last verified: 70.9% mean confidence on noise -- margin to 80%.
+    # Last verified: 66.8% mean confidence on noise -- margin to 80%.
     check(f"Noise mean confidence stays below 80% (got {mean_confidence:.1f}%)",
           mean_confidence < 80.0)
-    # Last verified: 38.7% false "confluence" rate on noise (post-F23) -- margin to 50%.
+    # Last verified: 11.5% false "confluence" rate on noise (post-G5 pattern-family
+    # coverage_denominator, down from 35.5% pre-G5) -- margin to 50%.
     check(f"Noise false-confluence rate stays below 50% (got {false_confluence_rate:.1%})",
           false_confluence_rate < 0.50)
+
+
+def test_pattern_stability_under_perturbation(n_trials=600):
+    """2nd Opus audit G25: the FIRST audit measured (t2_patterns.py Part C)
+    that adding just ONE extra bar of leading history changed the detected
+    trendline pattern's name 18.7% of the time and flipped its bias 13.9%
+    of the time, using the single-window classify_trendline_pattern. F25
+    replaced that with classify_trendline_pattern_ensemble (agreement
+    across 5 window sizes) specifically to fix this, but it was never
+    re-measured against the ensemble -- this closes that gap and pins the
+    result so a future change can't silently reintroduce the brittleness
+    without tripping this suite."""
+    same_name = 0
+    flipped_bias = 0
+    n = 0
+    for s in range(n_trials):
+        df = _make_noise_df(n=302, seed=s + 9000, drift=0.0005)
+        a = cp.classify_trendline_pattern_ensemble(df.iloc[:301])
+        b = cp.classify_trendline_pattern_ensemble(df.iloc[1:302])
+        if a is None or b is None:
+            continue
+        n += 1
+        if a.name == b.name:
+            same_name += 1
+        elif a.bias != b.bias:
+            flipped_bias += 1
+
+    same_name_rate = same_name / n if n else 0.0
+    flipped_bias_rate = flipped_bias / n if n else 0.0
+    print(f"  [+1-bar perturbation, n={n} comparable pairs] same name: {same_name_rate:.1%}, "
+          f"flipped name+bias: {flipped_bias_rate:.1%}")
+
+    # Last verified: 92.0% same-name (n=313) -- was 81.3% (18.7% flip rate)
+    # on the single-window version this replaced. Margin to 80%, i.e. this
+    # fails if the ensemble regresses back toward the pre-F25 number.
+    check(f"Pattern name stays stable across +1 leading bar >=80% of the time (got {same_name_rate:.1%})",
+          same_name_rate >= 0.80)
+    # Last verified: 6.7% flipped bias -- was 13.9% before F25. Margin to 20%.
+    check(f"Bias flips on +1 leading bar stay below 20% (got {flipped_bias_rate:.1%})",
+          flipped_bias_rate < 0.20)
 
 
 def main():
@@ -287,6 +329,9 @@ def main():
 
     print("\n=== Part B: synthetic-noise false-positive thresholds ===")
     test_noise_false_positive_rate()
+
+    print("\n=== Part C: pattern stability under +1 leading bar (G25) ===")
+    test_pattern_stability_under_perturbation()
 
     passed = sum(1 for _, ok in RESULTS if ok)
     total = len(RESULTS)
