@@ -53,10 +53,19 @@ def _read_all():
 
 
 def _write_all(rows):
-    with open(IV_HISTORY_PATH, "w", newline="") as f:
+    """Write via a temp file + atomic os.replace, not a direct truncating
+    write -- a 3rd audit verified that writing straight to IV_HISTORY_PATH
+    loses the ENTIRE log (not just one row) if interrupted between the
+    truncate and the writerows call (5 seeded rows -> 0 after a simulated
+    crash mid-write). os.replace is atomic on both POSIX and Windows, so a
+    reader always sees either the old complete file or the new complete
+    file, never a half-written one."""
+    tmp_path = IV_HISTORY_PATH + ".tmp"
+    with open(tmp_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=_FIELDNAMES)
         writer.writeheader()
         writer.writerows(rows)
+    os.replace(tmp_path, IV_HISTORY_PATH)
 
 
 def log_iv(ticker, report_date, iv, expiration, dte, snapshot_date):
@@ -85,13 +94,29 @@ def real_iv_rank(ticker, current_iv, lookback=FULL_LOOKBACK):
     calc_iv_rank's convention). Returns (percentile, n_samples) --
     percentile is None if fewer than MIN_SAMPLES_FOR_RANK readings exist,
     so callers never present a rank built on too little history as if it
-    were a real one."""
-    rows = [r for r in _read_all() if r["ticker"] == ticker]
-    rows.sort(key=lambda r: r["date"])
-    rows = rows[-lookback:]
-    n = len(rows)
-    if n < MIN_SAMPLES_FOR_RANK:
-        return None, n
-    from scipy import stats as scipy_stats
-    values = [float(r["iv"]) for r in rows]
-    return float(scipy_stats.percentileofscore(values, current_iv)), n
+    were a real one.
+
+    Wrapped end-to-end and skips unparseable rows rather than raising --
+    this is called from analyze_ticker on every report run (unlike
+    log_iv, it wasn't wrapped before this fix), and the module's own rule
+    is that nothing here may break report generation. A single blank/
+    corrupt `iv` cell in the CSV (e.g. from a partially-written row) must
+    not take the whole report down with it."""
+    try:
+        rows = [r for r in _read_all() if r.get("ticker") == ticker]
+        rows.sort(key=lambda r: r["date"])
+        rows = rows[-lookback:]
+        values = []
+        for r in rows:
+            try:
+                values.append(float(r["iv"]))
+            except (TypeError, ValueError, KeyError):
+                continue
+        n = len(values)
+        if n < MIN_SAMPLES_FOR_RANK:
+            return None, n
+        from scipy import stats as scipy_stats
+        return float(scipy_stats.percentileofscore(values, current_iv)), n
+    except Exception as e:
+        print(f"WARNING: IV history rank lookup failed: {e}")
+        return None, 0

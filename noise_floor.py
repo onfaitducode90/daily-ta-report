@@ -210,18 +210,29 @@ def make_synthetic_chain(spot, sigma, dte_days, rng, r=0.04, n_strikes=41):
 
 def credit_structure_quality(chain, side, target_delta):
     """Build a credit spread at `target_delta` and return its EV (using
-    the tool's own estimate_credit_structure_ev, judged by the structure's
-    OWN achieved delta -- the same standard the live report holds every
-    printed structure to) and credit/width ratio, or None if no valid
-    structure could be built at that target (delta tolerance, liquidity,
-    or width guards rejected everything)."""
+    the tool's own bs_true_p_itm + estimate_credit_structure_ev, judged
+    by the structure's OWN achieved delta/IV/DTE -- the same standard the
+    live report holds every printed structure to) and credit/width ratio,
+    or None if no valid structure could be built at that target (delta
+    tolerance, liquidity, or width guards rejected everything)."""
     spread = R.build_credit_spread(chain, SYNTH_EXP, side, target_short_delta=target_delta)
     if spread is None or spread["max_loss"] <= 0:
         return None
-    ev = R.estimate_credit_structure_ev(1 - abs(spread["short_delta"]), spread["credit"],
-                                          spread["max_loss"], num_legs=2)
+    p_itm = R.bs_true_p_itm(spread["short_delta"], spread["short_iv"], spread_dte(chain), side)
+    if p_itm is None:
+        return None
+    ev = R.estimate_credit_structure_ev(1 - p_itm, spread["haircut_credit"],
+                                          spread["haircut_max_loss"], num_legs=2)
     return {"ev_net": ev["ev_net"], "ratio": spread["credit"] / spread["width"],
             "achieved_delta": abs(spread["short_delta"])}
+
+
+def spread_dte(chain):
+    """Every quote in a synthetic chain shares the same days_to_expiration
+    (make_synthetic_chain builds one expiration per chain) -- read it off
+    the first quote rather than threading dte as a separate parameter
+    through every call site."""
+    return chain.quotes[0].days_to_expiration if chain.quotes else None
 
 
 def run_strike_selection_comparison(n_trials=1000, target_delta=0.25, jitter=0.05, seed=7):

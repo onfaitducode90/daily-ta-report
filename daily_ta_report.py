@@ -84,8 +84,29 @@ ALLOW_NAKED_STRUCTURES = False
 CHAIN_MAX_AGE_DAYS = 3          # reject a snapshot older than this vs. report_date
 DELTA_TOLERANCE = 0.05          # reject a strike whose |delta| misses the target by more
 MIN_OPEN_INTEREST = 100         # reject a leg with less OI than this
-MAX_BID_ASK_PCT_OF_CREDIT = 0.5  # reject a leg whose own bid-ask width exceeds this share of the spread's credit
+# Gates the COMBINED bid-ask width across BOTH legs, not each leg
+# independently -- a per-leg version at 0.5 let each side be up to 50%
+# of credit wide, permitting a combined worst-case crossing cost up to
+# 2x that (a 3rd audit measured this at 5.6x the EV model's modeled
+# commission). half of this combined width is also what the
+# haircut_credit fill-quality estimate below is based on.
+MAX_COMBINED_BID_ASK_PCT_OF_CREDIT = 0.275
 MIN_CREDIT_TO_WIDTH = 1.0 / 3.0  # below this, flag as a thin reward-to-risk trade (common retail rule of thumb)
+# 3rd audit: for a normal (concave, saturating) OTM premium curve,
+# credit/width is HIGHEST at the narrowest possible width and falls
+# monotonically as width grows (verified directly: 0.270 at 1pt of width
+# down to 0.181 at 8pt, same short strike, same chain) -- so "search
+# wider until the ratio clears MIN_CREDIT_TO_WIDTH" is self-defeating,
+# it never succeeds where the narrowest strike didn't (measured: search
+# collapsed the credit-structure hit rate on synthetic chains to 2.4%).
+# What was actually wrong (round 2's B3) was the WIDTH being spacing-
+# arbitrary and asymmetric between a structure's two legs (a live $1 put
+# wing beside a $2 call wing), not that it wasn't wide enough. Targeting
+# a small, deliberate, volatility-scaled width instead -- applied
+# symmetrically to both legs of a combined structure -- fixes that
+# without fighting the ratio's own monotonicity. 0.3 matches the ATR
+# multiplier calc_volume_poc already uses for intraday bin sizing.
+CREDIT_SPREAD_WIDTH_ATR_MULT = 0.3
 COMMISSION_PER_CONTRACT_LEG = 0.65  # MODELED flat commission per contract per leg (open+close each count) --
                                      # not your actual broker's schedule, just enough to catch structures whose
                                      # credit doesn't clear typical costs.
@@ -387,18 +408,46 @@ def fetch_real_iv_context(ticker, hv30_val, report_date, min_days=5, max_age_day
     }
 
 
-def build_credit_spread(chain, expiration, side, target_short_delta=0.25):
+def build_credit_spread(chain, expiration, side, target_short_delta=0.25, target_width=None):
     """Pick real strikes for a put or call credit spread from a loaded
     option chain: the short leg is whichever strike's |delta| is closest
-    to target_short_delta, the long leg is the next strike further
-    out-of-the-money. Returns None (never a fabricated/guessed strike, and
-    never a structure this tool can't stand behind) if:
+    to target_short_delta.
+
+    The long leg is chosen by TARGET WIDTH, not by blindly taking the
+    adjacent strike: among every further-OTM, liquidity-passing strike,
+    this picks the one whose width is CLOSEST to `target_width` (pass the
+    ticker's own ATR for a volatility-scaled, comparable-across-tickers
+    width; None falls back to the narrowest liquidity-passing strike).
+
+    An earlier version of this fix tried "the narrowest width whose
+    credit/width clears a 1/3 ratio floor" -- which turned out to be
+    self-defeating: for a normal (concave, saturating) OTM premium curve,
+    credit/width is HIGHEST at the narrowest possible width and decreases
+    monotonically as width grows (verified directly against a synthetic
+    chain: ratio fell from 0.270 at 1 point of width to 0.181 at 8).
+    Widening a spread never improves its ratio for a well-behaved chain,
+    so gating the width SEARCH on that ratio just rejected almost
+    everything (hit rate on synthetic chains: 2.4%). Targeting a
+    consistent WIDTH instead -- not a ratio -- is what actually fixes
+    the two real problems: a 2nd audit's asymmetric-wings finding (a $1
+    put wing beside a $2 call wing, purely from where strike spacing
+    happened to change) and a 3rd audit's 100%-firing thin-credit caveat
+    (which fired every time because "the narrowest available strike" is
+    definitionally the same shape every time -- an ATR-scaled target
+    gives the resulting ratio real variance to actually be informative
+    about, instead of being deterministic).
+
+    Returns None (never a fabricated/guessed strike, and never a
+    structure this tool can't stand behind) if:
       - delta data isn't populated for this expiration,
       - the achieved short delta misses target_short_delta by more than
         DELTA_TOLERANCE (a sparse delta column, common in the wings of a
         ToS export, can otherwise hand back a strike nowhere near what was
         asked for with no indication anything was off-target),
-      - there's no further strike on the chain to build the long leg from,
+      - no further-OTM strike on the chain passes the liquidity checks
+        below (with target_width given, this considers every candidate
+        rather than stopping at the first; with target_width=None it
+        still just needs the nearest one to pass),
       - the resulting credit would be >= the width (a stale/crossed/wide
         quote can otherwise produce a zero-or-negative max_loss, which
         crashed the report the first time a bad quote hit it),
@@ -418,6 +467,16 @@ def build_credit_spread(chain, expiration, side, target_short_delta=0.25):
     else:
         raise ValueError(f"side must be 'put' or 'call', got {side!r}")
 
+    def leg_bid_ask(leg):
+        bid, ask = getattr(leg, bid_attr), getattr(leg, ask_attr)
+        if bid is None or ask is None:
+            return None
+        return bid, ask
+
+    def leg_oi_ok(leg):
+        oi = getattr(leg, oi_attr)
+        return oi is not None and oi >= MIN_OPEN_INTEREST
+
     candidates = [q for q in quotes if getattr(q, delta_attr) is not None]
     if not candidates:
         return None
@@ -425,34 +484,75 @@ def build_credit_spread(chain, expiration, side, target_short_delta=0.25):
     achieved_delta = abs(getattr(short_q, delta_attr))
     if abs(achieved_delta - target_short_delta) > DELTA_TOLERANCE:
         return None
+    short_ba = leg_bid_ask(short_q)
+    if short_ba is None or not leg_oi_ok(short_q):
+        return None
+    short_bid, short_ask = short_ba
+
     idx = quotes.index(short_q)
-    # Further OTM means one strike lower for a put, one strike higher for a call.
-    long_idx = idx - 1 if side == "put" else idx + 1
-    if long_idx < 0 or long_idx >= len(quotes):
-        return None
-    long_q = quotes[long_idx]
+    # Further OTM means lower strikes for a put, higher strikes for a
+    # call -- iterate nearest-to-short-strike first in both cases.
+    further_strikes = list(reversed(quotes[:idx])) if side == "put" else quotes[idx + 1:]
 
-    short_mid, long_mid = getattr(short_q, mid_attr), getattr(long_q, mid_attr)
-    if short_mid is None or long_mid is None:
-        return None
-    credit = short_mid - long_mid
-    width = abs(short_q.strike - long_q.strike)
-    if credit <= 0 or width <= 0 or credit >= width:
+    short_mid = getattr(short_q, mid_attr)
+    if short_mid is None:
         return None
 
-    for leg in (short_q, long_q):
-        bid, ask = getattr(leg, bid_attr), getattr(leg, ask_attr)
-        if bid is None or ask is None:
-            return None
-        if (ask - bid) > MAX_BID_ASK_PCT_OF_CREDIT * credit:
-            return None
-        oi = getattr(leg, oi_attr)
-        if oi is None or oi < MIN_OPEN_INTEREST:
-            return None
+    best = None
+    for long_q in further_strikes:
+        long_mid = getattr(long_q, mid_attr)
+        if long_mid is None:
+            continue
+        credit = short_mid - long_mid
+        width = abs(short_q.strike - long_q.strike)
+        if credit <= 0 or width <= 0 or credit >= width:
+            continue
+        long_ba = leg_bid_ask(long_q)
+        if long_ba is None or not leg_oi_ok(long_q):
+            continue
+        long_bid, long_ask = long_ba
+        # Gate on the COMBINED bid-ask width across BOTH legs as a share
+        # of credit, not each leg independently -- a 3rd audit found the
+        # per-leg version let each leg independently be up to
+        # MAX_BID_ASK_PCT_OF_CREDIT wide, permitting a combined worst-case
+        # crossing cost up to 2x that share of credit (e.g. up to $14.50
+        # of unmodeled slippage per contract against a $2.60 modeled
+        # commission -- 5.6x the cost the EV model actually accounted
+        # for). combined_width is also what the fill-quality haircut
+        # below is based on.
+        combined_width = (short_ask - short_bid) + (long_ask - long_bid)
+        if combined_width > MAX_COMBINED_BID_ASK_PCT_OF_CREDIT * credit:
+            continue
+        candidate = (long_q, credit, width, combined_width)
+        if target_width is None:
+            # No target -- the nearest liquidity-passing strike IS the
+            # answer (it's also the highest-ratio one, since ratio only
+            # decreases from here as width grows).
+            best = candidate
+            break
+        if best is None or abs(width - target_width) < abs(best[2] - target_width):
+            best = candidate
+        elif width > target_width and abs(width - target_width) > abs(best[2] - target_width):
+            # Strikes get monotonically farther from target_width past
+            # this point (we're iterating nearest-to-short-strike first,
+            # so width is increasing) -- once a step moves further away
+            # than the current best, every later one will too.
+            break
 
+    if best is None:
+        return None
+    long_q, credit, width, combined_width = best
+    # "Fill at mid" is optimistic -- a real entry crosses part of the
+    # spread on at least one leg. haircut_credit assumes you give up HALF
+    # of the combined bid-ask width (i.e. filling roughly at the midpoint
+    # between mid and the worse side on each leg, not at the natural mid
+    # on both) -- used for EV purposes alongside the honestly-labeled
+    # mid-based `credit` shown in the report text.
+    haircut_credit = credit - 0.5 * combined_width
     return {
         "short_strike": short_q.strike, "long_strike": long_q.strike,
         "credit": credit, "width": width, "max_loss": width - credit,
+        "haircut_credit": haircut_credit, "haircut_max_loss": width - haircut_credit,
         "short_delta": getattr(short_q, delta_attr),
         # Real IV at the ACTUAL strike being sold, not the ATM figure the
         # rich/cheap gate above uses -- a 2nd audit noted ATM IV can be far
@@ -463,7 +563,7 @@ def build_credit_spread(chain, expiration, side, target_short_delta=0.25):
     }
 
 
-def check_jade_lizard(chain, expiration, put_spread, target_short_call_delta=0.25):
+def check_jade_lizard(chain, expiration, put_spread, target_short_call_delta=0.25, target_width=None):
     """Given an already-selected bull put spread, check whether swapping
     its long put for a naked short put and adding a short call spread on
     top prices out as a true Jade Lizard: upside-riskless requires the
@@ -475,7 +575,7 @@ def check_jade_lizard(chain, expiration, put_spread, target_short_call_delta=0.2
     short_put_q = next((q for q in quotes if q.strike == put_spread["short_strike"]), None)
     if short_put_q is None or short_put_q.put_mid is None:
         return None
-    call_spread = build_credit_spread(chain, expiration, "call", target_short_call_delta)
+    call_spread = build_credit_spread(chain, expiration, "call", target_short_call_delta, target_width)
     if call_spread is None:
         return None
     total_credit = short_put_q.put_mid + call_spread["credit"]
@@ -488,15 +588,65 @@ def check_jade_lizard(chain, expiration, put_spread, target_short_call_delta=0.2
     }
 
 
+def bs_true_p_itm(delta, iv, dte_days, side):
+    """Black-Scholes risk-neutral P(finishes in the money) for one leg,
+    recovered from its own quoted delta/IV/DTE -- NOT the same number as
+    |delta|, and a 3rd audit's own EV-model review caught that
+    |delta| is biased in OPPOSITE directions for calls vs. puts, not
+    uniformly as that audit's summary implied:
+
+    delta = N(d1); true P(ITM) = N(d2) for a call, N(-d2) for a put;
+    d1 - d2 = IV*sqrt(T) > 0 always. Since N is increasing:
+      calls: N(d1) > N(d2)   -> |delta| OVERSTATES true P(ITM)
+                                 -> 1-|delta| UNDERSTATES true P(win)
+      puts:  N(-d1) < N(-d2) -> |delta| UNDERSTATES true P(ITM)
+                                 -> 1-|delta| OVERSTATES true P(win)
+    Verified numerically at sigma=0.30/DTE=7 and sigma=0.60/DTE=21 against
+    a strike solved to match the target delta exactly, both directions
+    confirmed. This matters here because the Bull Put Spread and the
+    Jade Lizard's naked put -- this tool's two most common credit
+    structures -- are put-side, where the naive formula is too
+    OPTIMISTIC (understates loss probability), not too conservative.
+
+    Recovers d1 from delta via the inverse normal CDF, then converts to
+    d2 using the leg's own IV and time to expiration -- no spot/strike
+    needed. Falls back to |delta| (the old proxy) if IV or DTE is
+    missing, since d1 can't be recovered without them."""
+    if delta is None:
+        return None
+    if iv is None or iv <= 0 or dte_days is None or dte_days <= 0:
+        return abs(delta)
+    years = dte_days / 365.0
+    # Clip to keep ppf() finite for a delta that (due to quote noise) sits
+    # at exactly 0 or 1.
+    if side == "call":
+        d1 = scipy_stats.norm.ppf(min(max(delta, 1e-6), 1 - 1e-6))
+        d2 = d1 - iv * np.sqrt(years)
+        p_itm = scipy_stats.norm.cdf(d2)
+    else:
+        d1 = scipy_stats.norm.ppf(min(max(delta + 1, 1e-6), 1 - 1e-6))
+        d2 = d1 - iv * np.sqrt(years)
+        p_itm = scipy_stats.norm.cdf(-d2)
+    return float(np.clip(p_itm, 0.0, 1.0))
+
+
 def estimate_credit_structure_ev(p_win, credit, max_loss, num_legs):
-    """Rough per-contract expected value using the structure's OWN short
-    delta(s) as a P(finishes ITM) proxy -- not a real probability model
-    (delta isn't exactly P(ITM), and this ignores gamma/time decay path),
-    but the same approximation used to catch, in the 2nd Opus audit, a
-    live Iron Condor whose own numbers implied a win rate below what it
-    needed to break even. The point isn't precision, it's refusing to
-    print a structure that is a loser by ITS OWN inputs before you've
-    even paid a real bid-ask spread to get in.
+    """Rough per-contract expected value from a structure's win
+    probability (see bs_true_p_itm for how that's derived from the
+    structure's own delta/IV/DTE -- not a real probability model, since
+    this still ignores gamma/time-decay path and the loss distribution
+    conditional on breach, but a materially more accurate P(win) than the
+    1-|delta| proxy this replaced). The point isn't precision, it's
+    refusing to print a structure that is a loser by ITS OWN inputs
+    before you've even paid a real bid-ask spread to get in.
+
+    Callers should pass `credit`/`max_loss` from build_credit_spread's
+    `haircut_credit`/`haircut_max_loss` (fill assumed halfway between mid
+    and the worse side on each leg), not the raw mid-based `credit`/
+    `max_loss` also on that dict -- a 3rd audit found the gate permitted
+    up to 5.6x more unmodeled bid-ask slippage than the commission term
+    below actually models; the haircut folds a real fill-quality estimate
+    into EV instead of assuming a fill exactly at mid.
 
     `num_legs` is the total option legs (2 for a vertical, 4 for an iron
     condor) -- commission is modeled as open+close on every leg, so
@@ -516,8 +666,9 @@ def credit_structure_caveats(ev, credit, width):
     let a real chain snapshot read as an implicit recommendation."""
     caveats = []
     if ev is not None and ev["ev_net"] <= 0:
-        caveats.append(f"NEGATIVE EXPECTED VALUE by this tool's own delta-implied odds: "
-                        f"P(win) ~{ev['p_win']:.0%}, EV ${ev['ev_gross']:+.0f}/contract gross, "
+        caveats.append(f"NEGATIVE EXPECTED VALUE by this tool's own Black-Scholes-implied odds: "
+                        f"P(win) ~{ev['p_win']:.0%}, EV ${ev['ev_gross']:+.0f}/contract gross "
+                        "(credit already haircut for estimated bid-ask fill quality, not the mid), "
                         f"${ev['ev_net']:+.0f}/contract after ~${ev['commission']:.0f} modeled "
                         "round-trip commissions. Do not treat this as a recommendation.")
     ratio = credit / width if width else 0
@@ -2405,8 +2556,11 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
     if real_iv_context is not None and sell_premium_ok:
         chain, expiration = real_iv_context["chain"], real_iv_context["expiration"]
         chain_bit = f"{expiration} exp, {real_iv_context['snapshot_date']} chain snapshot"
+        credit_spread_target_width = (CREDIT_SPREAD_WIDTH_ATR_MULT * atr_val
+                                       if atr_val is not None else None)
         if bullish_edge:
-            spread = build_credit_spread(chain, expiration, "put", target_short_delta=0.25)
+            spread = build_credit_spread(chain, expiration, "put", target_short_delta=0.25,
+                                          target_width=credit_spread_target_width)
             if spread is not None and spread["max_loss"] > 0:
                 rr_credit = spread["credit"] / spread["max_loss"]
                 delta_bit = f" (short delta {spread['short_delta']:.2f}" if spread["short_delta"] is not None else ""
@@ -2417,12 +2571,14 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
                               f"sell {fmt_price(spread['short_strike'])}P / buy {fmt_price(spread['long_strike'])}P "
                               f"— credit {fmt_price(spread['credit'])}, width {fmt_price(spread['width'])}, "
                               f"max loss {fmt_price(spread['max_loss'])}, R:R {rr_credit:.2f}:1{delta_bit}")
-                ev = (estimate_credit_structure_ev(1 - abs(spread["short_delta"]), spread["credit"],
-                                                    spread["max_loss"], num_legs=2)
-                      if spread["short_delta"] is not None else None)
+                p_itm = bs_true_p_itm(spread["short_delta"], spread["short_iv"],
+                                       real_iv_context["dte"], "put")
+                ev = (estimate_credit_structure_ev(1 - p_itm, spread["haircut_credit"],
+                                                    spread["haircut_max_loss"], num_legs=2)
+                      if p_itm is not None else None)
                 for caveat in credit_structure_caveats(ev, spread["credit"], spread["width"]):
                     lines.append(f"  CAVEAT: {caveat}")
-                jade = check_jade_lizard(chain, expiration, spread)
+                jade = check_jade_lizard(chain, expiration, spread, target_width=credit_spread_target_width)
                 if jade is not None:
                     if jade["verified"]:
                         assignment_exposure = spread["short_strike"] * 100
@@ -2447,7 +2603,8 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
                 lines.append("Bull Put Spread: today's chain doesn't have a strike that clears this tool's "
                               "delta/liquidity/width bar — verify manually.")
         elif bearish_edge:
-            spread = build_credit_spread(chain, expiration, "call", target_short_delta=0.25)
+            spread = build_credit_spread(chain, expiration, "call", target_short_delta=0.25,
+                                          target_width=credit_spread_target_width)
             if spread is not None and spread["max_loss"] > 0:
                 rr_credit = spread["credit"] / spread["max_loss"]
                 delta_bit = f" (short delta {spread['short_delta']:.2f}" if spread["short_delta"] is not None else ""
@@ -2458,21 +2615,27 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
                               f"sell {fmt_price(spread['short_strike'])}C / buy {fmt_price(spread['long_strike'])}C "
                               f"— credit {fmt_price(spread['credit'])}, width {fmt_price(spread['width'])}, "
                               f"max loss {fmt_price(spread['max_loss'])}, R:R {rr_credit:.2f}:1{delta_bit}")
-                ev = (estimate_credit_structure_ev(1 - abs(spread["short_delta"]), spread["credit"],
-                                                    spread["max_loss"], num_legs=2)
-                      if spread["short_delta"] is not None else None)
+                p_itm = bs_true_p_itm(spread["short_delta"], spread["short_iv"],
+                                       real_iv_context["dte"], "call")
+                ev = (estimate_credit_structure_ev(1 - p_itm, spread["haircut_credit"],
+                                                    spread["haircut_max_loss"], num_legs=2)
+                      if p_itm is not None else None)
                 for caveat in credit_structure_caveats(ev, spread["credit"], spread["width"]):
                     lines.append(f"  CAVEAT: {caveat}")
             else:
                 lines.append("Bear Call Spread: today's chain doesn't have a strike that clears this tool's "
                               "delta/liquidity/width bar — verify manually.")
         elif not trending_market:
-            put_spread = build_credit_spread(chain, expiration, "put", target_short_delta=0.16)
-            call_spread = build_credit_spread(chain, expiration, "call", target_short_delta=0.16)
+            put_spread = build_credit_spread(chain, expiration, "put", target_short_delta=0.16,
+                                              target_width=credit_spread_target_width)
+            call_spread = build_credit_spread(chain, expiration, "call", target_short_delta=0.16,
+                                               target_width=credit_spread_target_width)
             if put_spread is not None and call_spread is not None:
                 total_credit = put_spread["credit"] + call_spread["credit"]
                 total_width = max(put_spread["width"], call_spread["width"])
                 max_loss = total_width - total_credit
+                total_haircut_credit = put_spread["haircut_credit"] + call_spread["haircut_credit"]
+                haircut_max_loss = total_width - total_haircut_credit
                 delta_bit = ""
                 if put_spread["short_delta"] is not None and call_spread["short_delta"] is not None:
                     iv_bit = ""
@@ -2487,9 +2650,21 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
                                   f"sell {fmt_price(put_spread['short_strike'])}P/buy {fmt_price(put_spread['long_strike'])}P "
                                   f"+ sell {fmt_price(call_spread['short_strike'])}C/buy {fmt_price(call_spread['long_strike'])}C "
                                   f"— total credit {fmt_price(total_credit)}, max loss {fmt_price(max_loss)}{rr_bit}{delta_bit}")
-                    if put_spread["short_delta"] is not None and call_spread["short_delta"] is not None:
-                        p_win = (1 - abs(put_spread["short_delta"])) * (1 - abs(call_spread["short_delta"]))
-                        ev = estimate_credit_structure_ev(p_win, total_credit, max_loss, num_legs=4)
+                    p_itm_put = bs_true_p_itm(put_spread["short_delta"], put_spread["short_iv"],
+                                               real_iv_context["dte"], "put")
+                    p_itm_call = bs_true_p_itm(call_spread["short_delta"], call_spread["short_iv"],
+                                                real_iv_context["dte"], "call")
+                    if p_itm_put is not None and p_itm_call is not None:
+                        # P(price stays between the two short strikes) = 1 - P(below put
+                        # strike) - P(above call strike) -- these are mutually exclusive
+                        # outcomes, not independent events, so this is NOT the product
+                        # (1-P_itm_put)*(1-P_itm_call) the code used before. The product
+                        # form overstates p_win: verified at matched deltas (0.16/0.16 ->
+                        # product 0.706 vs correct 0.680; 0.35/0.35 -> product 0.423 vs
+                        # correct 0.300), and the gap widens as either short leg gets
+                        # closer to the money.
+                        p_win = max(0.0, 1 - p_itm_put - p_itm_call)
+                        ev = estimate_credit_structure_ev(p_win, total_haircut_credit, haircut_max_loss, num_legs=4)
                         for caveat in credit_structure_caveats(ev, total_credit, total_width):
                             lines.append(f"  CAVEAT: {caveat}")
                 else:

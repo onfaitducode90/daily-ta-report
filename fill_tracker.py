@@ -56,6 +56,12 @@ def log_fill(ticker, report_date, structure, mid_credit, actual_credit, contract
     positive slippage means you collected LESS than the mid-based number
     implied -- the mid-price optimism this is meant to quantify."""
     os.makedirs(LOG_DIR, exist_ok=True)
+    # A 3rd audit noted notes was written verbatim -- a note starting with
+    # =/+/-/@ is a formula-injection payload if this CSV is later opened
+    # in Excel/Sheets. Prefix with a literal quote to neutralize it as a
+    # formula without changing what the note says.
+    if notes and notes[0] in "=+-@":
+        notes = "'" + notes
     slippage = mid_credit - actual_credit
     slippage_pct = (slippage / mid_credit * 100) if mid_credit else None
     row = {
@@ -65,7 +71,14 @@ def log_fill(ticker, report_date, structure, mid_credit, actual_credit, contract
         "slippage_pct_of_mid": f"{slippage_pct:.1f}" if slippage_pct is not None else "",
         "notes": notes, "logged_at": datetime.now().isoformat(),
     }
-    write_header = not os.path.exists(FILL_LOG_PATH)
+    # A 3rd audit found that checking existence alone silently eats the
+    # first fill if the file exists but is empty (e.g. an interrupted
+    # earlier write, or a manually `touch`-ed file): DictReader would
+    # then consume that first real fill AS the header, and
+    # summarize_fills would report "No fills logged yet" while the fill
+    # sits unrecoverable in the file. Also write the header on a
+    # zero-byte file.
+    write_header = not os.path.exists(FILL_LOG_PATH) or os.path.getsize(FILL_LOG_PATH) == 0
     with open(FILL_LOG_PATH, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=_FIELDNAMES)
         if write_header:
@@ -91,7 +104,14 @@ def summarize_fills():
     print(f"=== Fill quality: {len(rows)} logged fill(s) ===")
     print(f"Mean slippage: ${sum(slippages) / len(slippages):+.3f}/contract "
           f"(positive = filled worse than the mid-based number shown)")
-    print(f"Median slippage: ${sorted(slippages)[len(slippages) // 2]:+.3f}/contract")
+    sorted_slip = sorted(slippages)
+    mid = len(sorted_slip) // 2
+    # True median, not just the upper-middle element on an even n (a 3rd
+    # audit caught sorted(x)[len(x)//2] silently mislabeling that as the
+    # median for even-sized samples).
+    median_slip = (sorted_slip[mid] if len(sorted_slip) % 2
+                   else (sorted_slip[mid - 1] + sorted_slip[mid]) / 2)
+    print(f"Median slippage: ${median_slip:+.3f}/contract")
     if pcts:
         print(f"Mean slippage as % of mid credit: {sum(pcts) / len(pcts):+.1f}%")
     worst = max(rows, key=lambda r: float(r["slippage_per_contract"]))
