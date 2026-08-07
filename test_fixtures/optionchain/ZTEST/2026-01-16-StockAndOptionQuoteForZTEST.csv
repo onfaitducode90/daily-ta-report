@@ -1,0 +1,16 @@
+﻿Stock quote and option quote for ZTEST on 1/16/26 12:00:00
+
+UNDERLYING
+LAST,LX,Net Chng,BID,BX,ASK,AX,Size,Volume,Open,High,Low
+101.00,X,+1.00,100.95,X,101.05,X,100 x 100,"900,000",100.00,102.00,99.50
+
+UNDERLYING EXTRA INFO
+Last Size,Yield,PE,Div,Div.Freq,Ex Div.Date,52High,52Low,Shares,Beta
+100,<empty>,20.00,<empty>,--,,120.00,80.00,"500,000,000",1.20
+
+13 AUG 26  (7)  100 (Weeklys)
+,,Impl Vol,Delta,Volume,Open.Int,BID,BX,ASK,AX,Exp,Strike,BID,BX,ASK,AX,Impl Vol,Delta,Volume,Open.Int,,
+,,41.00%,0.65,20,600,7.50,X,7.70,X,13 AUG 26,95,0.60,X,0.70,X,50.00%,-0.30,15,600,,
+,,39.00%,0.50,50,1200,3.90,X,4.10,X,13 AUG 26,100,3.00,X,3.20,X,39.00%,-0.50,45,1100,,
+,,37.00%,0.30,18,400,1.55,X,1.65,X,13 AUG 26,105,5.60,X,5.80,X,37.00%,-0.65,12,450,,
+

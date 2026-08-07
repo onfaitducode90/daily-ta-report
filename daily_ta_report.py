@@ -53,6 +53,21 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ACCOUNT_SIZE = 230_000
 RISK_PCT_PER_TRADE = 0.01
 
+# Credit-structure strike selection / staleness / EV gates (2nd Opus audit,
+# G1-G4). These don't make the tool a broker-grade pricer -- they exist to
+# stop it from presenting a structure as "verified" when the chain is
+# stale, the achieved strike misses its delta target, the quote is too
+# illiquid to trust the mid, or the tool's own delta-implied numbers say
+# the structure is a net loser.
+CHAIN_MAX_AGE_DAYS = 3          # reject a snapshot older than this vs. report_date
+DELTA_TOLERANCE = 0.05          # reject a strike whose |delta| misses the target by more
+MIN_OPEN_INTEREST = 100         # reject a leg with less OI than this
+MAX_BID_ASK_PCT_OF_CREDIT = 0.5  # reject a leg whose own bid-ask width exceeds this share of the spread's credit
+MIN_CREDIT_TO_WIDTH = 1.0 / 3.0  # below this, flag as a thin reward-to-risk trade (common retail rule of thumb)
+COMMISSION_PER_CONTRACT_LEG = 0.65  # MODELED flat commission per contract per leg (open+close each count) --
+                                     # not your actual broker's schedule, just enough to catch structures whose
+                                     # credit doesn't clear typical costs.
+
 # Source: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
 # (fetched 2026-08-06). Each entry is the SECOND day of the 2-day FOMC
 # meeting -- that's the actual decision/press-conference day that moves
@@ -291,7 +306,7 @@ def fetch_next_dividend_date(ticker):
         return None
 
 
-def fetch_real_iv_context(ticker, hv30_val, min_days=5):
+def fetch_real_iv_context(ticker, hv30_val, report_date, min_days=5, max_age_days=CHAIN_MAX_AGE_DAYS):
     """Best-effort REAL implied-volatility read from a locally downloaded
     ThinkorSwim option-chain snapshot (option_chain.py), for tickers where
     one exists. Returns None if no chain is available -- callers must fall
@@ -302,21 +317,32 @@ def fetch_real_iv_context(ticker, hv30_val, min_days=5):
     when IV exceeds what has actually been realized, not just when IV is
     "high" in some absolute sense) -- over trying to build an IV-rank
     percentile, since only a handful of daily snapshots exist locally
-    (nowhere near the ~252 trading days a real percentile needs)."""
+    (nowhere near the ~252 trading days a real percentile needs).
+
+    `report_date` anchors every staleness/DTE check to the report's own
+    date -- not wall-clock "today", and NOT the chain snapshot's own date,
+    which this function used to silently trust. A 2nd audit caught that: a
+    week-old snapshot could hand back an expiration that had already
+    passed relative to today, with dte computed as if the snapshot were
+    current. Now this returns None outright once the snapshot is older
+    than `max_age_days`, and again if the nearest qualifying expiration
+    turns out to have already passed report_date."""
     try:
         chain = option_chain.load_chain(ticker)
     except Exception:
         return None
     if chain is None:
         return None
+    snapshot_date = chain.snapshot_time.date()
+    if (report_date - snapshot_date).days > max_age_days:
+        return None
     expiration = chain.nearest_expiration(min_days=min_days)
-    if expiration is None:
+    if expiration is None or expiration <= report_date:
         return None
     iv = chain.atm_iv(expiration)
     if iv is None:
         return None
-    snapshot_date = chain.snapshot_time.date()
-    dte = (expiration - snapshot_date).days
+    dte = (expiration - report_date).days
     return {
         "chain": chain, "expiration": expiration, "dte": dte, "iv": iv,
         "snapshot_date": snapshot_date,
@@ -328,14 +354,30 @@ def build_credit_spread(chain, expiration, side, target_short_delta=0.25):
     """Pick real strikes for a put or call credit spread from a loaded
     option chain: the short leg is whichever strike's |delta| is closest
     to target_short_delta, the long leg is the next strike further
-    out-of-the-money. Returns None (never a fabricated/guessed strike) if
-    delta data isn't populated for this expiration or there's no further
-    strike on the chain to build the long leg from."""
+    out-of-the-money. Returns None (never a fabricated/guessed strike, and
+    never a structure this tool can't stand behind) if:
+      - delta data isn't populated for this expiration,
+      - the achieved short delta misses target_short_delta by more than
+        DELTA_TOLERANCE (a sparse delta column, common in the wings of a
+        ToS export, can otherwise hand back a strike nowhere near what was
+        asked for with no indication anything was off-target),
+      - there's no further strike on the chain to build the long leg from,
+      - the resulting credit would be >= the width (a stale/crossed/wide
+        quote can otherwise produce a zero-or-negative max_loss, which
+        crashed the report the first time a bad quote hit it),
+      - either leg's own bid-ask is too wide relative to the credit to
+        trust its mid, or
+      - either leg's open interest is too thin to trust the market is
+        real (this and the bid-ask check use data option_chain.py already
+        parses -- greeks, OI, both bid/ask legs -- that nothing was
+        checking before)."""
     quotes = sorted(chain.for_expiration(expiration), key=lambda q: q.strike)
     if side == "put":
         delta_attr, mid_attr = "put_delta", "put_mid"
+        bid_attr, ask_attr, oi_attr = "put_bid", "put_ask", "put_open_interest"
     elif side == "call":
         delta_attr, mid_attr = "call_delta", "call_mid"
+        bid_attr, ask_attr, oi_attr = "call_bid", "call_ask", "call_open_interest"
     else:
         raise ValueError(f"side must be 'put' or 'call', got {side!r}")
 
@@ -343,6 +385,9 @@ def build_credit_spread(chain, expiration, side, target_short_delta=0.25):
     if not candidates:
         return None
     short_q = min(candidates, key=lambda q: abs(abs(getattr(q, delta_attr)) - target_short_delta))
+    achieved_delta = abs(getattr(short_q, delta_attr))
+    if abs(achieved_delta - target_short_delta) > DELTA_TOLERANCE:
+        return None
     idx = quotes.index(short_q)
     # Further OTM means one strike lower for a put, one strike higher for a call.
     long_idx = idx - 1 if side == "put" else idx + 1
@@ -355,8 +400,19 @@ def build_credit_spread(chain, expiration, side, target_short_delta=0.25):
         return None
     credit = short_mid - long_mid
     width = abs(short_q.strike - long_q.strike)
-    if credit <= 0 or width <= 0:
+    if credit <= 0 or width <= 0 or credit >= width:
         return None
+
+    for leg in (short_q, long_q):
+        bid, ask = getattr(leg, bid_attr), getattr(leg, ask_attr)
+        if bid is None or ask is None:
+            return None
+        if (ask - bid) > MAX_BID_ASK_PCT_OF_CREDIT * credit:
+            return None
+        oi = getattr(leg, oi_attr)
+        if oi is None or oi < MIN_OPEN_INTEREST:
+            return None
+
     return {
         "short_strike": short_q.strike, "long_strike": long_q.strike,
         "credit": credit, "width": width, "max_loss": width - credit,
@@ -387,6 +443,46 @@ def check_jade_lizard(chain, expiration, put_spread, target_short_call_delta=0.2
         "total_credit": total_credit,
         "verified": total_credit >= call_spread["width"],
     }
+
+
+def estimate_credit_structure_ev(p_win, credit, max_loss, num_legs):
+    """Rough per-contract expected value using the structure's OWN short
+    delta(s) as a P(finishes ITM) proxy -- not a real probability model
+    (delta isn't exactly P(ITM), and this ignores gamma/time decay path),
+    but the same approximation used to catch, in the 2nd Opus audit, a
+    live Iron Condor whose own numbers implied a win rate below what it
+    needed to break even. The point isn't precision, it's refusing to
+    print a structure that is a loser by ITS OWN inputs before you've
+    even paid a real bid-ask spread to get in.
+
+    `num_legs` is the total option legs (2 for a vertical, 4 for an iron
+    condor) -- commission is modeled as open+close on every leg, so
+    round-trip cost = num_legs * 2 * COMMISSION_PER_CONTRACT_LEG."""
+    p_loss = 1 - p_win
+    ev_gross = (p_win * credit - p_loss * max_loss) * 100
+    commission = num_legs * 2 * COMMISSION_PER_CONTRACT_LEG
+    ev_net = ev_gross - commission
+    return {"p_win": p_win, "p_loss": p_loss, "ev_gross": ev_gross,
+            "commission": commission, "ev_net": ev_net}
+
+
+def credit_structure_caveats(ev, credit, width):
+    """Plain-language flags for a credit structure that is technically
+    "verified" (real strikes, positive credit) but still a bad trade by
+    the tool's own numbers -- never hides the structure, just refuses to
+    let a real chain snapshot read as an implicit recommendation."""
+    caveats = []
+    if ev is not None and ev["ev_net"] <= 0:
+        caveats.append(f"NEGATIVE EXPECTED VALUE by this tool's own delta-implied odds: "
+                        f"P(win) ~{ev['p_win']:.0%}, EV ${ev['ev_gross']:+.0f}/contract gross, "
+                        f"${ev['ev_net']:+.0f}/contract after ~${ev['commission']:.0f} modeled "
+                        "round-trip commissions. Do not treat this as a recommendation.")
+    ratio = credit / width if width else 0
+    if ratio < MIN_CREDIT_TO_WIDTH:
+        caveats.append(f"Thin reward-to-risk: credit is only {ratio:.0%} of width "
+                        f"(below the {MIN_CREDIT_TO_WIDTH:.0%} rule-of-thumb minimum) -- "
+                        "risking a lot to make a little.")
+    return caveats
 
 
 # ---------------------------------------------------------------------------
@@ -1085,7 +1181,7 @@ def build_market_context_section(vix_value, vix_timestamp, vix_is_stale, spy_tre
                 lines.append(f"FOMC WARNING: Fed rate decision on {fomc_date} "
                               f"({days_to_fomc} day{'s' if days_to_fomc != 1 else ''} away) -- a "
                               "market-wide event, not ticker-specific. Expect IV to run up into it "
-                              "and crush after; every ticker's volatility read above is unreliable "
+                              "and crush after; every ticker's volatility read below is unreliable "
                               "until it's past.")
             else:
                 lines.append(f"Next FOMC decision: {fomc_date}.")
@@ -1129,6 +1225,15 @@ def collapse_family(label, family_signals, weight_cap, coverage_denominator=None
 
 FAMILY_WEIGHT_CAP = 4.0
 TREND_FAMILY_SIZE = 6  # Swing structure (daily), Weekly structure, 200 SMA, MACD, ADX/DI, Momentum
+# Unlike the trend family, "how many patterns could possibly exist" isn't a
+# fixed number -- but the pattern family had NO coverage scaling at all,
+# which a 2nd audit caught: a single Forming candlestick (weight 1.5, the
+# only signal in its family) collapses to lean=1.0 -> weight = 1.0 *
+# FAMILY_WEIGHT_CAP = 4.0, i.e. 89% of MIN_CONFLUENCE_WEIGHT from one
+# forming pattern alone. 3 is chosen from the noise-day measurement in
+# that audit (mean ~1.9 patterns/report on pure noise) -- one pattern
+# should contribute a THIRD of the cap, not all of it.
+PATTERN_FAMILY_COVERAGE = 3
 # With only 2 possible families, a single family's vote alone can reach at
 # most FAMILY_WEIGHT_CAP. Setting the floor just above that means a
 # directional call structurally REQUIRES both families to be present and
@@ -1252,7 +1357,8 @@ def compute_confluence(df, pattern_matches):
 
     trend_vote = collapse_family("Trend/Momentum", trend_indicator_signals,
                                   FAMILY_WEIGHT_CAP, coverage_denominator=TREND_FAMILY_SIZE)
-    pattern_vote = collapse_family("Pattern geometry", pattern_signals, FAMILY_WEIGHT_CAP)
+    pattern_vote = collapse_family("Pattern geometry", pattern_signals, FAMILY_WEIGHT_CAP,
+                                    coverage_denominator=PATTERN_FAMILY_COVERAGE)
     signals = [v for v in (trend_vote, pattern_vote) if v is not None]
 
     bull_weight = sum(w for _, d, w, _ in signals if d > 0)
@@ -1705,7 +1811,7 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
         if hv30_val is not None:
             lines.append(f"HV30: {hv30_val * 100:.1f}%")
 
-            real_iv_context = fetch_real_iv_context(ticker, hv30_val)
+            real_iv_context = fetch_real_iv_context(ticker, hv30_val, report_date)
             if real_iv_context is not None:
                 iv = real_iv_context["iv"]
                 spread = real_iv_context["iv_minus_hv"]
@@ -1906,6 +2012,31 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
         iv_rich_fallback = iv_rank is None and hv30_val is not None and hv30_val > 0.50
     sell_premium_ok = iv_high or iv_rich_fallback
 
+    # Earnings/FOMC dates are needed here (not just for the warning text
+    # further down) so they can actually GATE sell_premium_ok. A 2nd audit
+    # caught that the EARNINGS WARNING text said "do not treat this as a
+    # premium-selling signal" while sell_premium_ok stayed unchanged and
+    # the chain block below it printed verified strikes anyway -- advisory
+    # text next to actionable strikes is the weaker half of "suppressed or
+    # hard-flagged." This makes it suppressed.
+    earnings_date = fetch_next_earnings_date(ticker)
+    days_to_earnings = (earnings_date - report_date).days if earnings_date is not None else None
+    earnings_imminent = days_to_earnings is not None and 0 <= days_to_earnings <= 7
+
+    fomc_date = next_fomc_date(report_date)
+    days_to_fomc = (fomc_date - report_date).days if fomc_date is not None else None
+    fomc_imminent = days_to_fomc is not None and 0 <= days_to_fomc <= 7
+
+    sell_premium_blocked_reason = None
+    if sell_premium_ok and earnings_imminent:
+        sell_premium_blocked_reason = (f"earnings on {earnings_date} "
+                                        f"({days_to_earnings}d away) make the volatility read unreliable")
+    elif sell_premium_ok and fomc_imminent:
+        sell_premium_blocked_reason = (f"FOMC decision on {fomc_date} "
+                                        f"({days_to_fomc}d away) makes the volatility read unreliable")
+    if sell_premium_blocked_reason is not None:
+        sell_premium_ok = False
+
     # A directional call additionally requires the same minimum-evidence
     # floor as the confluence verdict above -- net can cross +/-0.15 on a
     # single thin signal, and Trade Idea must not act more confident than
@@ -1926,7 +2057,7 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
         exp_bit = f"{real_iv_context['expiration']} exp"
         if iv_high:
             vol_text = (f"Real ATM IV {iv_pct:.0f}% ({exp_bit}) is {spread_pct:+.1f} pts over HV30 "
-                        "— premium genuinely rich, verified against today's chain")
+                        f"— premium genuinely rich, per the {real_iv_context['snapshot_date']} chain snapshot")
         elif iv_low:
             vol_text = (f"Real ATM IV {iv_pct:.0f}% ({exp_bit}) is {spread_pct:.1f} pts under HV30 "
                         "— premium not rich; selling here has little edge")
@@ -1945,20 +2076,20 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
     else:
         vol_text = "IV rank unavailable and volatility not clearly elevated"
     lines.append(f"Volatility read: {vol_text}")
+    if sell_premium_blocked_reason is not None:
+        lines.append(f"Premium-selling structures suppressed below: {sell_premium_blocked_reason}.")
 
     trend_text = (f"Trending (ADX {adx_val:.0f})" if trending_market
                   else f"Ranging (ADX {adx_val:.0f})" if adx_val is not None
                   else "Insufficient data")
     lines.append(f"Trend regime: {trend_text}")
 
-    earnings_date = fetch_next_earnings_date(ticker)
-    days_to_earnings = (earnings_date - report_date).days if earnings_date is not None else None
-    if days_to_earnings is not None and 0 <= days_to_earnings <= 7:
+    if earnings_imminent:
         lines.append(f"EARNINGS WARNING: {ticker} reports on {earnings_date} "
                       f"({days_to_earnings} day{'s' if days_to_earnings != 1 else ''} away). "
                       "The volatility read above is unreliable heading into a binary event -- "
                       "IV typically rises ahead of earnings while realized vol (what this tool "
-                      "measures) does not. Do not treat this as a premium-selling signal until "
+                      "measures) does not. Premium-selling structures are suppressed until "
                       "after the event.")
     elif earnings_date is not None:
         lines.append(f"Next earnings: {earnings_date}.")
@@ -2027,9 +2158,11 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
     elif has_directional_setup:
         lines.append("Reference target: unavailable — risk/reward cannot be assessed.")
     elif not trending_market and sell_premium_ok:
+        chain_note = (f"a real strike/credit breakdown is below, from the {real_iv_context['snapshot_date']} chain"
+                      if real_iv_context is not None else
+                      "no local option chain for this ticker -- structure selection is yours, against a real chain")
         lines.append("Setup shape: ranging tape with volatility read favoring premium sale over "
-                      "direction -- a non-directional structure (verified against a real chain) "
-                      "may fit better than a directional one here.")
+                      f"direction -- a non-directional structure may fit better than a directional one here ({chain_note}).")
     else:
         lines.append("No actionable setup: insufficient directional evidence and no clear "
                       "volatility edge either way.")
@@ -2040,15 +2173,21 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
     # theoretical. ----
     if real_iv_context is not None and sell_premium_ok:
         chain, expiration = real_iv_context["chain"], real_iv_context["expiration"]
+        chain_bit = f"{expiration} exp, {real_iv_context['snapshot_date']} chain snapshot"
         if bullish_edge:
             spread = build_credit_spread(chain, expiration, "put", target_short_delta=0.25)
-            if spread is not None:
+            if spread is not None and spread["max_loss"] > 0:
                 rr_credit = spread["credit"] / spread["max_loss"]
                 delta_bit = f" (short delta {spread['short_delta']:.2f})" if spread["short_delta"] is not None else ""
-                lines.append(f"Bull Put Spread ({expiration} exp, verified against today's chain): "
+                lines.append(f"Bull Put Spread ({chain_bit}): "
                               f"sell {fmt_price(spread['short_strike'])}P / buy {fmt_price(spread['long_strike'])}P "
                               f"— credit {fmt_price(spread['credit'])}, width {fmt_price(spread['width'])}, "
                               f"max loss {fmt_price(spread['max_loss'])}, R:R {rr_credit:.2f}:1{delta_bit}")
+                ev = (estimate_credit_structure_ev(1 - abs(spread["short_delta"]), spread["credit"],
+                                                    spread["max_loss"], num_legs=2)
+                      if spread["short_delta"] is not None else None)
+                for caveat in credit_structure_caveats(ev, spread["credit"], spread["width"]):
+                    lines.append(f"  CAVEAT: {caveat}")
                 jade = check_jade_lizard(chain, expiration, spread)
                 if jade is not None:
                     if jade["verified"]:
@@ -2064,34 +2203,54 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
                                       f"short of the {fmt_price(jade['call_width'])} width needed to cover upside "
                                       "risk — stick with the put spread alone.)")
             else:
-                lines.append("Bull Put Spread: today's chain doesn't have enough delta/bid-ask data "
-                              "to select strikes automatically — verify manually.")
+                lines.append("Bull Put Spread: today's chain doesn't have a strike that clears this tool's "
+                              "delta/liquidity/width bar — verify manually.")
         elif bearish_edge:
             spread = build_credit_spread(chain, expiration, "call", target_short_delta=0.25)
-            if spread is not None:
+            if spread is not None and spread["max_loss"] > 0:
                 rr_credit = spread["credit"] / spread["max_loss"]
                 delta_bit = f" (short delta {spread['short_delta']:.2f})" if spread["short_delta"] is not None else ""
-                lines.append(f"Bear Call Spread ({expiration} exp, verified against today's chain): "
+                lines.append(f"Bear Call Spread ({chain_bit}): "
                               f"sell {fmt_price(spread['short_strike'])}C / buy {fmt_price(spread['long_strike'])}C "
                               f"— credit {fmt_price(spread['credit'])}, width {fmt_price(spread['width'])}, "
                               f"max loss {fmt_price(spread['max_loss'])}, R:R {rr_credit:.2f}:1{delta_bit}")
+                ev = (estimate_credit_structure_ev(1 - abs(spread["short_delta"]), spread["credit"],
+                                                    spread["max_loss"], num_legs=2)
+                      if spread["short_delta"] is not None else None)
+                for caveat in credit_structure_caveats(ev, spread["credit"], spread["width"]):
+                    lines.append(f"  CAVEAT: {caveat}")
             else:
-                lines.append("Bear Call Spread: today's chain doesn't have enough delta/bid-ask data "
-                              "to select strikes automatically — verify manually.")
+                lines.append("Bear Call Spread: today's chain doesn't have a strike that clears this tool's "
+                              "delta/liquidity/width bar — verify manually.")
         elif not trending_market:
             put_spread = build_credit_spread(chain, expiration, "put", target_short_delta=0.16)
             call_spread = build_credit_spread(chain, expiration, "call", target_short_delta=0.16)
             if put_spread is not None and call_spread is not None:
                 total_credit = put_spread["credit"] + call_spread["credit"]
-                max_loss = max(put_spread["width"], call_spread["width"]) - total_credit
-                rr_bit = f", R:R {total_credit / max_loss:.2f}:1" if max_loss > 0 else ""
-                lines.append(f"Iron Condor ({expiration} exp, verified against today's chain): "
-                              f"sell {fmt_price(put_spread['short_strike'])}P/buy {fmt_price(put_spread['long_strike'])}P "
-                              f"+ sell {fmt_price(call_spread['short_strike'])}C/buy {fmt_price(call_spread['long_strike'])}C "
-                              f"— total credit {fmt_price(total_credit)}, max loss {fmt_price(max_loss)}{rr_bit}")
+                total_width = max(put_spread["width"], call_spread["width"])
+                max_loss = total_width - total_credit
+                delta_bit = ""
+                if put_spread["short_delta"] is not None and call_spread["short_delta"] is not None:
+                    delta_bit = (f" (short deltas {put_spread['short_delta']:.2f}P / "
+                                  f"{call_spread['short_delta']:.2f}C)")
+                if max_loss > 0:
+                    rr_bit = f", R:R {total_credit / max_loss:.2f}:1"
+                    lines.append(f"Iron Condor ({chain_bit}): "
+                                  f"sell {fmt_price(put_spread['short_strike'])}P/buy {fmt_price(put_spread['long_strike'])}P "
+                                  f"+ sell {fmt_price(call_spread['short_strike'])}C/buy {fmt_price(call_spread['long_strike'])}C "
+                                  f"— total credit {fmt_price(total_credit)}, max loss {fmt_price(max_loss)}{rr_bit}{delta_bit}")
+                    if put_spread["short_delta"] is not None and call_spread["short_delta"] is not None:
+                        p_win = (1 - abs(put_spread["short_delta"])) * (1 - abs(call_spread["short_delta"]))
+                        ev = estimate_credit_structure_ev(p_win, total_credit, max_loss, num_legs=4)
+                        for caveat in credit_structure_caveats(ev, total_credit, total_width):
+                            lines.append(f"  CAVEAT: {caveat}")
+                else:
+                    lines.append(f"Iron Condor: today's chain prices this combination at credit "
+                                  f"{fmt_price(total_credit)} >= max width {fmt_price(total_width)} -- "
+                                  "not a valid credit structure at these strikes, skipping.")
             else:
-                lines.append("Iron Condor: today's chain doesn't have enough delta/bid-ask data "
-                              "to select strikes automatically — verify manually.")
+                lines.append("Iron Condor: today's chain doesn't have strikes that clear this tool's "
+                              "delta/liquidity/width bar — verify manually.")
 
     if divergence:
         direction_word = "bullish" if any("Bullish" in d for d in divergence) else "bearish"
@@ -2187,8 +2346,22 @@ def main():
         premarket_data = None
         if mode == "morning" and df is not None:
             premarket_data = fetch_premarket(ticker)
-        section, portfolio_info = analyze_ticker(ticker, df, mode, report_date, premarket_data,
-                                                  spy_df=data.get("SPY"))
+        # A 2nd audit found analyze_ticker unguarded here: one bad quote in
+        # one local chain file (or any other single-ticker failure) raised
+        # all the way out and killed the ENTIRE report, for every ticker,
+        # including the ones that had nothing wrong with them. The new
+        # guards in build_credit_spread close the specific crash that was
+        # found, but this is the backstop for whatever wasn't found.
+        try:
+            section, portfolio_info = analyze_ticker(ticker, df, mode, report_date, premarket_data,
+                                                       spy_df=data.get("SPY"))
+        except Exception as e:
+            safe_print(f"WARNING: {ticker} failed to analyze ({e}) -- skipping it, "
+                       "continuing with the rest of the report.")
+            section = (f"{'=' * 60}\n{ticker}\n{'=' * 60}\n"
+                       f"ERROR: analysis failed for this ticker ({e}) -- see console/logs. "
+                       "Every other ticker in this report is unaffected.")
+            portfolio_info = None
         report_lines.append(section)
         report_lines.append("")
         portfolio_infos.append(portfolio_info)

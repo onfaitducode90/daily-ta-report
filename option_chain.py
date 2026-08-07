@@ -23,11 +23,10 @@ separators appear as quoted CSV fields ("10,624"), which the csv module
 already un-quotes; this module additionally strips the embedded comma
 before converting to int.
 
-This module only PARSES the files -- it does not change how
-daily_ta_report.py computes IV rank or names option structures. That's a
-separate integration decision once the parser itself is verified against
-real exports (see the module docstring's note in daily_ta_report.py's
-Trade Idea section for why that integration hasn't been wired in yet).
+This module only PARSES the files -- daily_ta_report.py (fetch_real_iv_context,
+build_credit_spread, check_jade_lizard) is the integration layer that
+decides what to do with a parsed chain; this module just needs to parse
+one correctly.
 """
 
 import csv
@@ -36,7 +35,13 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
-BASE_DIR = r"C:\Users\Steph\Documents\code to review by Claude\spread_tool\optionchain"
+# Overridable via TA_OPTION_CHAIN_DIR (a 2nd audit flagged this as a
+# hardcoded absolute Windows path with no way to point it elsewhere --
+# e.g. at the committed test_fixtures/optionchain/ directory, or at a
+# different machine's download location -- without editing this file).
+BASE_DIR = os.environ.get(
+    "TA_OPTION_CHAIN_DIR",
+    r"C:\Users\Steph\Documents\code to review by Claude\spread_tool\optionchain")
 
 _SECTION_HEADER_RE = re.compile(
     r"^(\d{1,2} [A-Z]{3} \d{2})\s+\((\d+)\)\s+(\d+)(?:\s+\((\w+)\))?\s*$")
