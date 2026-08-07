@@ -1351,6 +1351,25 @@ def collapse_family(label, family_signals, weight_cap, coverage_denominator=None
 
 FAMILY_WEIGHT_CAP = 4.0
 TREND_FAMILY_SIZE = 6  # Swing structure (daily), Weekly structure, 200 SMA, MACD, ADX/DI, Momentum
+# G20 (2nd Opus audit): backtest.py was re-run on identical data (NVDA,
+# INTC, SPY, QQQ; 2017-08-04 to 2026-07-07; same 1796 eval dates/ticker)
+# comparing TREND_FAMILY_SIZE=5 with the weekly-structure signal disabled
+# (pre-F31) against 6 with it (current). Result, stated plainly: adding
+# the weekly signal cut the directional-call rate from 33.7% to 21.2%
+# (more selective, as intended) and improved the +1-bar hit rate (54.5%
+# -> 56.8%), but WORSENED hit rate at +5/+10/+20 bars (51.6/56.5/56.0% ->
+# 51.1/54.5/53.9%). In BOTH configurations, the tool's own directional
+# calls underperformed simple buy-and-hold and 50/200-SMA-crossover
+# baselines on the SAME dates at every horizon beyond +1 bar. This is one
+# non-independent-observations backtest (see backtest.py's own caveats on
+# overlapping windows), not a rigorous conclusion either way -- but it is
+# real evidence, where before there was none, and it does NOT show the
+# weekly signal earning its added selectivity through better realized
+# accuracy. Kept at 6 because the selectivity itself (fewer, more
+# conservative calls) is independently defensible and the accuracy
+# swing is small relative to this backtest's own noise -- but this
+# should be revisited if a properly independent (non-overlapping,
+# walk-forward) backtest becomes feasible.
 # Unlike the trend family, "how many patterns could possibly exist" isn't a
 # fixed number -- but the pattern family had NO coverage scaling at all,
 # which a 2nd audit caught: a single Forming candlestick (weight 1.5, the
