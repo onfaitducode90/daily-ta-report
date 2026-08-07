@@ -72,6 +72,22 @@ def _fmt_price(value):
     return f"${value:.2f}"
 
 
+def _cap_target_to_52wk_range(raw_target, full_df):
+    """Cap a measured-move price target at the last-252-bar high/low as a
+    sanity bound. A measured-move target (neckline +/- pattern height, or a
+    trendline extrapolation) is arithmetic on a FITTED shape, not a price
+    the stock has ever actually traded at -- with no bound it can land
+    well outside the 52-week range. This was previously applied only
+    inside classify_trendline_pattern; a 2nd audit caught that
+    _build_pt_match (Double/Triple Top/Bottom, H&S, Inverse H&S) had no
+    cap at all, so a fix to one engine silently left the other uncapped.
+    `full_df` must be the UNWINDOWED history, not the pattern-detection
+    window -- a 90-bar lookback slice would just cap against itself."""
+    year_window = full_df.tail(min(len(full_df), 252))
+    year_high, year_low = float(year_window["High"].max()), float(year_window["Low"].min())
+    return min(max(raw_target, year_low), year_high)
+
+
 # ---------------------------------------------------------------------------
 # Shared primitives (duplicated from daily_ta_report.py to avoid a circular
 # import — these are small and pure, so keeping this module self-contained
@@ -414,10 +430,7 @@ def classify_trendline_pattern(df, window=60, swing_lookback=3, min_pivots_per_l
         elif breakout_dir == "down":
             raw_target = lower_now - width_first
         if raw_target is not None:
-            year_window = df.tail(min(len(df), 252))
-            year_high, year_low = float(year_window["High"].max()), float(year_window["Low"].min())
-            capped_target = min(max(raw_target, year_low), year_high)
-            price_target = _fmt_price(capped_target)
+            price_target = _fmt_price(_cap_target_to_52wk_range(raw_target, df))
 
     formed_pos = max(upper_pts[-1][0], lower_pts[-1][0])
     formed_date = str(sub.index[formed_pos].date())
@@ -503,7 +516,7 @@ def classify_trendline_pattern_ensemble(df, windows=(40, 50, 60, 70, 80), swing_
 # ---------------------------------------------------------------------------
 
 def _build_pt_match(name, bias, shape_diff, neckline_diff, extreme_price, neckline,
-                     atr_val, formed_pos, sub, current_price, breakout_dir,
+                     atr_val, formed_pos, sub, current_price, breakout_dir, full_df,
                      pullback_depth=None, shoulder_tol=0.05, neckline_tol=0.04):
     shape_score = max(0.0, 1 - shape_diff / shoulder_tol)
     neckline_score = max(0.0, 1 - neckline_diff / neckline_tol)
@@ -527,6 +540,8 @@ def _build_pt_match(name, bias, shape_diff, neckline_diff, extreme_price, neckli
         elif current_price < extreme_price - buffer:
             status = "Invalidated"
         target = neckline + height
+
+    target = _cap_target_to_52wk_range(target, full_df)
 
     formed_date = str(sub.index[formed_pos].date())
     detail = f"Neckline ~{_fmt_price(neckline)}, extreme {_fmt_price(extreme_price)}"
@@ -583,7 +598,7 @@ def classify_peak_trough_pattern(df, lookback_bars=90, swing_lookback=3,
                     if neckline_diff <= neckline_tol:
                         return _build_pt_match("Head and Shoulders", "Bearish", outer_diff,
                                                 neckline_diff, mid, neckline, atr_val,
-                                                idxs[-1], sub, current_price, "down",
+                                                idxs[-1], sub, current_price, "down", df,
                                                 shoulder_tol=shoulder_tol, neckline_tol=neckline_tol)
                 all_vals = [outer[0], mid, outer[1]]
                 spread = (max(all_vals) - min(all_vals)) / max(all_vals)
@@ -593,7 +608,7 @@ def classify_peak_trough_pattern(df, lookback_bars=90, swing_lookback=3,
                     if neckline_diff <= neckline_tol:
                         return _build_pt_match("Triple Top", "Bearish", spread, neckline_diff,
                                                 max(all_vals), neckline, atr_val,
-                                                idxs[-1], sub, current_price, "down",
+                                                idxs[-1], sub, current_price, "down", df,
                                                 shoulder_tol=shoulder_tol, neckline_tol=neckline_tol)
             else:
                 if outer_diff <= shoulder_tol:
@@ -602,7 +617,7 @@ def classify_peak_trough_pattern(df, lookback_bars=90, swing_lookback=3,
                     if pullback_depth >= 1.0:
                         return _build_pt_match("Double Top", "Bearish", outer_diff, 0.0,
                                                 max(outer), neckline, atr_val,
-                                                idxs[-1], sub, current_price, "down",
+                                                idxs[-1], sub, current_price, "down", df,
                                                 pullback_depth=pullback_depth,
                                                 shoulder_tol=shoulder_tol, neckline_tol=neckline_tol)
 
@@ -617,7 +632,7 @@ def classify_peak_trough_pattern(df, lookback_bars=90, swing_lookback=3,
                     if neckline_diff <= neckline_tol:
                         return _build_pt_match("Inverse Head and Shoulders", "Bullish", outer_diff,
                                                 neckline_diff, mid, neckline, atr_val,
-                                                idxs[-1], sub, current_price, "up",
+                                                idxs[-1], sub, current_price, "up", df,
                                                 shoulder_tol=shoulder_tol, neckline_tol=neckline_tol)
                 all_vals = [outer[0], mid, outer[1]]
                 spread = (max(all_vals) - min(all_vals)) / max(all_vals)
@@ -627,7 +642,7 @@ def classify_peak_trough_pattern(df, lookback_bars=90, swing_lookback=3,
                     if neckline_diff <= neckline_tol:
                         return _build_pt_match("Triple Bottom", "Bullish", spread, neckline_diff,
                                                 min(all_vals), neckline, atr_val,
-                                                idxs[-1], sub, current_price, "up",
+                                                idxs[-1], sub, current_price, "up", df,
                                                 shoulder_tol=shoulder_tol, neckline_tol=neckline_tol)
             else:
                 if outer_diff <= shoulder_tol:
@@ -636,7 +651,7 @@ def classify_peak_trough_pattern(df, lookback_bars=90, swing_lookback=3,
                     if pullback_depth >= 1.0:
                         return _build_pt_match("Double Bottom", "Bullish", outer_diff, 0.0,
                                                 min(outer), neckline, atr_val,
-                                                idxs[-1], sub, current_price, "up",
+                                                idxs[-1], sub, current_price, "up", df,
                                                 pullback_depth=pullback_depth,
                                                 shoulder_tol=shoulder_tol, neckline_tol=neckline_tol)
     return None

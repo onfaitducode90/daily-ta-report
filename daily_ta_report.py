@@ -8,11 +8,15 @@ defined watchlist using yfinance data only.
 import os
 import sys
 import warnings
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time
 
 import numpy as np
 import pandas as pd
-from pandas.tseries.holiday import USFederalHolidayCalendar
+from pandas.tseries.holiday import (
+    AbstractHolidayCalendar, Holiday, nearest_workday,
+    USMartinLutherKingJr, USPresidentsDay, USMemorialDay, USLaborDay,
+    USThanksgivingDay, GoodFriday,
+)
 from scipy import stats as scipy_stats
 
 warnings.filterwarnings("ignore")
@@ -52,6 +56,23 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # the real chain. Update these if your account size or risk rule changes.
 ACCOUNT_SIZE = 230_000
 RISK_PCT_PER_TRADE = 0.01
+# The 1%-risk-at-1-ATR share count alone has no ceiling: a low-ATR name
+# can size up to a large fraction of the account before the stop-distance
+# math even notices. A 2nd audit's own live example -- 296 shares of a
+# ~$219 stock, $64.6k notional, 28% of a $230k account -- came entirely
+# from the risk formula with nothing capping total dollars deployed in
+# one name. This caps notional independently of the risk-based count.
+MAX_NOTIONAL_PCT_PER_TRADE = 0.20
+
+# A "verified" Jade Lizard (see check_jade_lizard) swaps the put spread's
+# long leg for a naked short put -- upside risk becomes fully covered by
+# credit, but downside becomes UNDEFINED (assignment exposure = strike x
+# 100/contract). A 2nd audit noted this reads as an upgrade while quietly
+# handing back the defined-risk-only guarantee a put spread has. Set False
+# (the default) to still show the Jade Lizard math as information, but
+# never let it read as the tool's actual recommendation; set True to
+# allow it if you've decided you're fine holding naked short premium.
+ALLOW_NAKED_STRUCTURES = False
 
 # Credit-structure strike selection / staleness / EV gates (2nd Opus audit,
 # G1-G4). These don't make the tool a broker-grade pricer -- they exist to
@@ -216,19 +237,27 @@ def calc_session_vwap(intraday_df, session_date=None):
     typical-price*volume / cumulative volume across that session's own
     real intraday bars, not a daily-bar approximation. Uses the most
     recent session present in intraday_df unless `session_date` (itself
-    present in the data) is given. Returns (vwap, session_date_used) or
-    (None, None)."""
+    present in the data) is given. Returns (vwap, session_date_used,
+    is_partial) or (None, None, None).
+
+    is_partial is True when the session's last bar is earlier than the
+    normal close (15:55 ET, the start of the last 5-minute bar of a full
+    day) -- an intraday run partway through the day would otherwise
+    silently return a partial-session VWAP with nothing distinguishing it
+    from a completed session's final (different, and no longer moving)
+    number."""
     if intraday_df is None or intraday_df.empty:
-        return None, None
+        return None, None, None
     bar_dates = intraday_df.index.date
     dates_present = sorted(set(bar_dates))
     target = session_date if session_date in dates_present else dates_present[-1]
     session = intraday_df[bar_dates == target]
     if session.empty or session["Volume"].sum() <= 0:
-        return None, None
+        return None, None, None
     typical = (session["High"] + session["Low"] + session["Close"]) / 3
     vwap = (typical * session["Volume"]).sum() / session["Volume"].sum()
-    return float(vwap), target
+    is_partial = session.index[-1].time() < time(15, 55)
+    return float(vwap), target, is_partial
 
 
 def fetch_vix():
@@ -806,6 +835,26 @@ def calc_volume_poc(df, window=20, atr_val=None, bins=None):
     return float(poc)
 
 
+def calc_intraday_poc_bins(intraday_df, min_bins=20, max_bins=40):
+    """Bin count for calc_volume_poc when called on real intraday bars
+    (not daily ones) -- neither of the two things tried before this
+    worked: a fixed bins=100 was 0.0146 daily-ATR per bin (3.5x less
+    stable under bootstrap resampling than ATR-sized bins, i.e. overfit
+    to individual 5-minute prints), and sizing off the DAILY ATR (the
+    0.3*atr_val default in calc_volume_poc) gave only ~5 bins across a
+    multi-session intraday range -- too coarse to be a profile at all.
+    Targets a bin width of roughly one typical 5-minute bar's own range
+    -- a natural intraday scale that needs no daily-vs-intraday
+    conversion factor -- clamped to [min_bins, max_bins]."""
+    price_range = float(intraday_df["High"].max() - intraday_df["Low"].min())
+    if price_range <= 0:
+        return min_bins
+    median_bar_range = float((intraday_df["High"] - intraday_df["Low"]).median())
+    if median_bar_range <= 0:
+        return min_bins
+    return int(min(max(round(price_range / median_bar_range), min_bins), max_bins))
+
+
 def calc_beta_correlation(ticker_df, spy_df, window=63):
     """Rolling correlation and beta of this ticker's daily returns against
     SPY's, over the trailing `window` (default ~1 quarter) trading days
@@ -860,7 +909,34 @@ def calc_iv_rank(close, window=30, lookback=252):
     return float(rank)
 
 
-_US_HOLIDAY_CALENDAR = USFederalHolidayCalendar()
+class NYSEHolidayCalendar(AbstractHolidayCalendar):
+    """NYSE market holidays. USFederalHolidayCalendar (used here
+    previously) is a FEDERAL GOVERNMENT holiday list, not a market one --
+    it wrongly included Columbus Day and Veterans Day (NYSE is open on
+    both) and omitted Good Friday (NYSE is closed, no federal holiday
+    covers it -- e.g. 2026-04-03). A 2nd audit caught this still being
+    wrong despite the caveat in the docstring below acknowledging it.
+    Reuses pandas' own rule objects for every date this calendar shares
+    with the federal one, so those stay in sync automatically; only the
+    NYSE-specific differences are hand-written. Still not exhaustive --
+    one-off closures (e.g. a national day of mourning) aren't captured --
+    but no longer wrong on two recurring, predictable dates every year."""
+    rules = [
+        Holiday("New Year's Day", month=1, day=1, observance=nearest_workday),
+        USMartinLutherKingJr,
+        USPresidentsDay,
+        GoodFriday,
+        USMemorialDay,
+        Holiday("Juneteenth National Independence Day", month=6, day=19,
+                start_date="2021-06-18", observance=nearest_workday),
+        Holiday("Independence Day", month=7, day=4, observance=nearest_workday),
+        USLaborDay,
+        USThanksgivingDay,
+        Holiday("Christmas Day", month=12, day=25, observance=nearest_workday),
+    ]
+
+
+_US_HOLIDAY_CALENDAR = NYSEHolidayCalendar()
 
 
 def days_until_next_friday(from_date):
@@ -869,10 +945,10 @@ def days_until_next_friday(from_date):
     convention -- returning calendar days instead overstated the expected
     move by 18% when run on a Friday and 9.5% on a Saturday, since a
     calendar-day count includes weekend days with no price movement to
-    scale for. US federal holidays are used as a market-holiday proxy; this
-    is not perfectly NYSE-accurate (e.g. it includes Columbus Day, which
-    NYSE does not observe, and omits Good Friday, which NYSE does) but is a
-    large improvement over pure calendar days with no new dependency."""
+    scale for. Uses NYSEHolidayCalendar (see above) as the market-holiday
+    proxy -- not perfectly NYSE-accurate (one-off closures aren't
+    captured), but correct on every recurring NYSE holiday, including the
+    two the previous federal-calendar version got wrong."""
     calendar_days_ahead = (4 - from_date.weekday()) % 7  # Friday = weekday 4
     if calendar_days_ahead == 0:
         calendar_days_ahead = 7  # next Friday, not today
@@ -1185,6 +1261,9 @@ def build_market_context_section(vix_value, vix_timestamp, vix_is_stale, spy_tre
                               "until it's past.")
             else:
                 lines.append(f"Next FOMC decision: {fomc_date}.")
+        else:
+            lines.append(f"FOMC calendar needs its annual refresh -- no dates on file on/after "
+                          f"{report_date} (see FOMC_DECISION_DATES_2026 and the source URL above it).")
     return lines
 
 
@@ -1392,8 +1471,12 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
     min_days_required = 30
     has_min_data = len(df) >= min_days_required
 
-    if ticker == "SPCX" and len(df) < 60:
-        lines.append(f"NOTE: SPCX has only {len(df)} trading days of history — "
+    # Generalized from a ticker == "SPCX" hardcode (SPCX was a recent IPO
+    # early in this project with under 60 days of history at the time) --
+    # any young ticker in WATCHLIST should get the same heads-up, not just
+    # whichever one prompted the original note.
+    if len(df) < 60:
+        lines.append(f"NOTE: {ticker} has only {len(df)} trading days of history — "
                       f"sections requiring more history will be skipped/limited.")
 
     if not has_min_data:
@@ -1554,9 +1637,10 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
     else:
         lines.append("5-day VWAP: Insufficient data")
 
-    session_vwap, session_vwap_date = calc_session_vwap(intraday_df)
+    session_vwap, session_vwap_date, session_vwap_partial = calc_session_vwap(intraday_df)
     if session_vwap is not None:
-        lines.append(f"Session VWAP ({session_vwap_date}, real intraday bars): {fmt_price(session_vwap)} "
+        partial_bit = " [session in progress -- will keep moving until close]" if session_vwap_partial else ""
+        lines.append(f"Session VWAP ({session_vwap_date}, real intraday bars){partial_bit}: {fmt_price(session_vwap)} "
                       f"— price {'above' if current_price > session_vwap else 'below'} "
                       f"({fmt_pct((current_price - session_vwap) / session_vwap * 100)})")
 
@@ -1572,7 +1656,8 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
         lines.append("Volume POC: Insufficient data")
 
     if intraday_df is not None and len(intraday_df) >= 30:
-        intraday_poc = calc_volume_poc(intraday_df, window=len(intraday_df), atr_val=poc_atr, bins=100)
+        intraday_bins = calc_intraday_poc_bins(intraday_df)
+        intraday_poc = calc_volume_poc(intraday_df, window=len(intraday_df), bins=intraday_bins)
         n_sessions = len(set(intraday_df.index.date))
         lines.append(f"Volume POC ({n_sessions}-session, real intraday bars): {fmt_price(intraday_poc)} "
                       "— highest volume concentration, real volume-at-price rather than a daily-bar approximation")
@@ -2049,7 +2134,15 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
     bearish_pattern = next((pm for pm in pattern_matches
                              if pm.bias == "Bearish" and pm.status != "Invalidated"), None)
 
-    lines.append(f"Directional bias: {net_label} (net {net:+.2f})")
+    # net can be maxed (+/-1.00) purely from which side happened to have
+    # SOME signal, independent of whether the evidence floor was cleared
+    # -- a 2nd audit caught this printing "Insufficient evidence (net
+    # +1.00)" live, which reads as high confidence right next to a "no
+    # edge" verdict. Only show net once it's actually backed by
+    # sufficient_evidence; show total_weight instead otherwise, which is
+    # the number that actually explains why the verdict is what it is.
+    net_bit = f"(net {net:+.2f})" if sufficient_evidence else f"(total weight {total_weight:.1f})"
+    lines.append(f"Directional bias: {net_label} {net_bit}")
 
     if real_iv_context is not None and real_iv_context["iv_minus_hv"] is not None:
         iv_pct = real_iv_context["iv"] * 100
@@ -2149,10 +2242,20 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
                           "1-ATR stop. Treat this as a weak setup even though a directional edge exists.")
         else:
             risk_dollars = ACCOUNT_SIZE * RISK_PCT_PER_TRADE
-            shares = int(risk_dollars // atr_val)
-            lines.append(f"Position size (equity/stock only): ~{shares} shares — risking "
-                          f"{fmt_price(risk_dollars)} ({RISK_PCT_PER_TRADE * 100:.1f}% of a "
-                          f"{fmt_price(ACCOUNT_SIZE)} account) at the {fmt_price(atr_val)} stop distance. "
+            risk_shares = int(risk_dollars // atr_val)
+            max_notional = ACCOUNT_SIZE * MAX_NOTIONAL_PCT_PER_TRADE
+            notional_shares = int(max_notional // current_price) if current_price > 0 else risk_shares
+            shares = min(risk_shares, notional_shares)
+            capped_bit = ""
+            if notional_shares < risk_shares:
+                capped_bit = (f" (capped down from {risk_shares} — the 1%-risk/{fmt_price(atr_val)}-stop math "
+                               f"alone would size {fmt_price(risk_shares * current_price)} notional, over the "
+                               f"{MAX_NOTIONAL_PCT_PER_TRADE * 100:.0f}% of account this tool caps a single "
+                               "name at regardless of stop distance)")
+            lines.append(f"Position size (equity/stock only): ~{shares} shares{capped_bit} — risking "
+                          f"{fmt_price(min(shares * atr_val, risk_dollars))} "
+                          f"({RISK_PCT_PER_TRADE * 100:.1f}% of a {fmt_price(ACCOUNT_SIZE)} account) at the "
+                          f"{fmt_price(atr_val)} stop distance, {fmt_price(shares * current_price)} notional. "
                           "For an options structure, size by the structure's own max loss instead of "
                           "share count -- this number assumes a straight equity position.")
     elif has_directional_setup:
@@ -2191,11 +2294,18 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
                 jade = check_jade_lizard(chain, expiration, spread)
                 if jade is not None:
                     if jade["verified"]:
+                        assignment_exposure = spread["short_strike"] * 100
+                        stance_bit = ("" if ALLOW_NAKED_STRUCTURES else
+                                      "  NOT shown as a recommendation (ALLOW_NAKED_STRUCTURES=False -- "
+                                      "this account's rule is defined-risk only); shown as information.")
                         lines.append(f"  -> Verified as a Jade Lizard: naked {fmt_price(spread['short_strike'])}P "
                                       f"+ sell {fmt_price(jade['call_short_strike'])}C / buy "
                                       f"{fmt_price(jade['call_long_strike'])}C — total credit "
                                       f"{fmt_price(jade['total_credit'])} >= call spread width "
-                                      f"{fmt_price(jade['call_width'])}, so upside risk is fully covered by credit.")
+                                      f"{fmt_price(jade['call_width'])}, so upside risk is fully covered by credit. "
+                                      f"DOWNSIDE IS UNDEFINED: the naked put means assignment exposure of "
+                                      f"{fmt_price(assignment_exposure)}/contract (strike x 100) if it finishes "
+                                      f"ITM, not the put spread's defined max loss.{stance_bit}")
                     else:
                         lines.append(f"  (Adding a {fmt_price(jade['call_short_strike'])}C/"
                                       f"{fmt_price(jade['call_long_strike'])}C call spread would NOT make this a "

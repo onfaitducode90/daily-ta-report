@@ -129,8 +129,12 @@ class OptionChain:
         return sum(ivs) / len(ivs) if ivs else None
 
 
-def _parse_month_date(text, snapshot_year_hint):
-    """'7 AUG 26' -> date(2026, 8, 7)."""
+def _parse_month_date(text):
+    """'7 AUG 26' -> date(2026, 8, 7). The year comes straight from the
+    2-digit field in `text` itself (ToS always prints one) -- an earlier
+    version took a snapshot_year_hint parameter that was never actually
+    used for anything, since the real year was always parsed from the
+    text anyway."""
     parts = text.split()
     day = int(parts[0])
     month = datetime.strptime(parts[1], "%b").month
@@ -232,7 +236,7 @@ def parse_option_chain_csv(path):
         section_match = _SECTION_HEADER_RE.match(line.strip())
         if section_match:
             exp_text, dte_text, _mult, _cycle = section_match.groups()
-            expiration = _parse_month_date(exp_text, snapshot_time.year)
+            expiration = _parse_month_date(exp_text)
             dte = int(dte_text)
             i += 1
             # The header row has 2 leading blank columns (",,Impl Vol,...")
