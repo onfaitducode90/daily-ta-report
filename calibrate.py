@@ -56,42 +56,63 @@ def _connect():
     return sqlite3.connect(prediction_log.DB_PATH)
 
 
-def _fetch_confidence_hit_pairs(conn, horizon):
+def _fetch_confidence_hit_pairs(conn, horizon, code_versions=None):
     """One (confidence, direction_hit) pair per DISTINCT (ticker,
     report_date, pattern_name) -- de-duplicated across mode (morning/
     intraday/evening), which otherwise silently triples nearly every
     observation (same day, same spot, usually the same detected pattern).
     Prefers the evening row when more than one mode logged the same
     pattern that day (most complete data for that session); falls back to
-    whichever mode is present otherwise."""
-    rows = conn.execute(
-        "SELECT p.ticker, p.report_date, p.pattern_name, p.confidence, po.direction_hit, r.mode "
-        "FROM pattern_outcomes po "
-        "JOIN patterns p ON p.run_id = po.run_id AND p.pattern_name = po.pattern_name "
-        "JOIN runs r ON r.run_id = po.run_id "
-        "WHERE po.horizon_bars = ? AND po.direction_hit IS NOT NULL",
-        (horizon,)).fetchall()
+    whichever mode is present otherwise.
+
+    Rows with a NULL code_version (logged before that column existed) are
+    always excluded -- a 3rd audit found the DB already had rows from at
+    least 3 materially different confluence implementations with no way
+    to tell them apart (same run_id shape, same total_weight,
+    contradictory net_label). If `code_versions` is given, ALSO restrict
+    to just those git SHAs; otherwise every tagged version is pooled, but
+    the caller (calibrate_horizon) reports the version breakdown so a
+    mixture is visible rather than silent -- filtering to a single commit
+    by default would mean calibration data essentially never accumulates
+    in a project that commits this often, which trades one problem for a
+    worse one."""
+    query = ("SELECT p.ticker, p.report_date, p.pattern_name, p.confidence, po.direction_hit, "
+             "r.mode, p.code_version "
+             "FROM pattern_outcomes po "
+             "JOIN patterns p ON p.run_id = po.run_id AND p.pattern_name = po.pattern_name "
+             "JOIN runs r ON r.run_id = po.run_id "
+             "WHERE po.horizon_bars = ? AND po.direction_hit IS NOT NULL "
+             "AND p.code_version IS NOT NULL")
+    params = [horizon]
+    if code_versions:
+        query += f" AND p.code_version IN ({','.join('?' * len(code_versions))})"
+        params.extend(code_versions)
+    rows = conn.execute(query, params).fetchall()
 
     mode_rank = {"evening": 0, "intraday": 1, "morning": 2}
     best = {}
-    for ticker, report_date, pattern_name, confidence, direction_hit, mode in rows:
+    version_counts = {}
+    for ticker, report_date, pattern_name, confidence, direction_hit, mode, code_version in rows:
         key = (ticker, report_date, pattern_name)
         rank = mode_rank.get(mode, 99)
         if key not in best or rank < best[key][0]:
             best[key] = (rank, confidence, direction_hit)
+        version_counts[code_version] = version_counts.get(code_version, 0) + 1
 
     pairs = [(v[1], v[2]) for v in best.values()]
     n_distinct_ticker_dates = len({(k[0], k[1]) for k in best})
-    return pairs, n_distinct_ticker_dates
+    return pairs, n_distinct_ticker_dates, version_counts
 
 
-def calibrate_horizon(conn, horizon):
-    pairs, n_distinct_ticker_dates = _fetch_confidence_hit_pairs(conn, horizon)
+def calibrate_horizon(conn, horizon, code_versions=None):
+    pairs, n_distinct_ticker_dates, version_counts = _fetch_confidence_hit_pairs(
+        conn, horizon, code_versions)
     n = len(pairs)
     result = {
         "horizon": horizon, "n": n, "n_distinct_ticker_dates": n_distinct_ticker_dates,
         "sufficient": n_distinct_ticker_dates >= MIN_SAMPLES_PROVISIONAL,
         "reliable": n_distinct_ticker_dates >= MIN_SAMPLES_RELIABLE,
+        "version_counts": version_counts,
     }
     if not result["sufficient"]:
         return result
@@ -226,6 +247,12 @@ def main():
                         else f"PROVISIONAL -- need {MIN_SAMPLES_RELIABLE}+ distinct ticker-dates for real reliability")
         print(f"+{h} bars: {result['n_distinct_ticker_dates']} distinct ticker-dates "
               f"({result['n']} pattern observations) [{reliability}]")
+        if len(result["version_counts"]) > 1:
+            versions_str = ", ".join(f"{v}={c}" for v, c in
+                                      sorted(result["version_counts"].items(), key=lambda x: -x[1]))
+            print(f"  NOTE: this pools {len(result['version_counts'])} different code versions "
+                  f"({versions_str}) -- pass code_versions=[...] to calibrate_horizon to restrict "
+                  "to a single version if you suspect the underlying logic changed enough to matter.")
         print(f"  overall hit rate: {result['overall_hit_rate'] * 100:.1f}%")
         print(f"  correlation(confidence, hit): {result['correlation']:.3f} "
               f"(p={result['p_value']:.3f}, Holm-Bonferroni-adjusted across {len(HORIZONS)} horizons)")

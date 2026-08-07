@@ -96,6 +96,22 @@ def real_iv_rank(ticker, current_iv, lookback=FULL_LOOKBACK):
     so callers never present a rank built on too little history as if it
     were a real one.
 
+    Naming note (3rd audit): this is scipy's percentileofscore -- "what
+    fraction of past readings were at or below today's" -- not the
+    alternate (current-min)/(max-min)*100 formula some options platforms
+    also call "IV Rank". Kept as `_rank` rather than renamed to
+    `_percentile` to match calc_iv_rank (daily_ta_report.py), which
+    computes the same percentileofscore formula for the HV-based proxy
+    this function is meant to eventually replace -- two different names
+    for the same methodology would be more confusing than one name used
+    consistently, even though "percentile" is arguably the more precise
+    term for what's actually computed.
+
+    Wrapped end-to-end and skips unparseable rows rather than raising --
+    this is called from analyze_ticker on every report run (unlike
+    log_iv, it wasn't wrapped before this fix), and the module's own rule
+    is that nothing here may break report generation. A single blank/
+
     Wrapped end-to-end and skips unparseable rows rather than raising --
     this is called from analyze_ticker on every report run (unlike
     log_iv, it wasn't wrapped before this fix), and the module's own rule

@@ -239,13 +239,21 @@ def parse_option_chain_csv(path):
             expiration = _parse_month_date(exp_text)
             dte = int(dte_text)
             i += 1
+            # A far-dated/illiquid expiration (observed: a LEAPS section
+            # with zero strikes) can have NO column-header row at all --
+            # just a blank line straight to the next section header. That
+            # is a legitimately empty section, not a malformed file, so
+            # it's skipped rather than treated as a format mismatch.
+            if i >= n or raw_lines[i].strip() == "":
+                continue
             # The header row has 2 leading blank columns (",,Impl Vol,...")
             # before the columns this parser actually keys off of.
-            actual_cols = [c.strip() for c in rows[i][2:2 + len(_EXPECTED_COLUMNS)]] if i < n else []
+            actual_cols = [c.strip() for c in rows[i][2:2 + len(_EXPECTED_COLUMNS)]]
             if actual_cols != _EXPECTED_COLUMNS:
                 # Not the column header we expect right after a section
-                # title -- don't guess column positions against a layout
-                # that doesn't match what this parser was built for.
+                # title, and not simply blank/empty either -- don't guess
+                # column positions against a layout that doesn't match
+                # what this parser was built for.
                 raise ValueError(f"{path}: unexpected columns after {exp_text!r} "
                                   f"section header: {actual_cols!r}")
             i += 1

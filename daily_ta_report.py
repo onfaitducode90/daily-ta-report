@@ -82,7 +82,13 @@ ALLOW_NAKED_STRUCTURES = False
 # illiquid to trust the mid, or the tool's own delta-implied numbers say
 # the structure is a net loser.
 CHAIN_MAX_AGE_DAYS = 3          # reject a snapshot older than this vs. report_date
-DELTA_TOLERANCE = 0.05          # reject a strike whose |delta| misses the target by more
+# RELATIVE, not absolute -- a flat +/-0.05 is +/-20% at the 0.25 vertical
+# target but +/-31% at the 0.16 iron condor target (and the condor has
+# TWO short legs, so that looser tolerance compounds across both). 0.20
+# matches what the flat 0.05 already meant for the more common 0.25
+# target; the condor's 0.16 target now gets the same relative precision
+# instead of a looser absolute one.
+DELTA_TOLERANCE_PCT = 0.20
 MIN_OPEN_INTEREST = 100         # reject a leg with less OI than this
 # Gates the COMBINED bid-ask width across BOTH legs, not each leg
 # independently -- a per-leg version at 0.5 let each side be up to 50%
@@ -385,7 +391,13 @@ def fetch_real_iv_context(ticker, hv30_val, report_date, min_days=5, max_age_day
     if chain is None:
         return None
     snapshot_date = chain.snapshot_time.date()
-    if (report_date - snapshot_date).days > max_age_days:
+    chain_age_days = (report_date - snapshot_date).days
+    # Also reject a NEGATIVE age (a snapshot dated after report_date) --
+    # a 3rd audit found the old ">" check let a future-dated snapshot
+    # through silently (clock skew, a timezone-crossed download, or a
+    # mistyped filename could all produce one), which isn't "fresh", it's
+    # nonsensical.
+    if not (0 <= chain_age_days <= max_age_days):
         return None
     expiration = chain.nearest_expiration(min_days=min_days)
     if expiration is None or expiration <= report_date:
@@ -441,9 +453,10 @@ def build_credit_spread(chain, expiration, side, target_short_delta=0.25, target
     structure this tool can't stand behind) if:
       - delta data isn't populated for this expiration,
       - the achieved short delta misses target_short_delta by more than
-        DELTA_TOLERANCE (a sparse delta column, common in the wings of a
-        ToS export, can otherwise hand back a strike nowhere near what was
-        asked for with no indication anything was off-target),
+        DELTA_TOLERANCE_PCT of the target (a sparse delta column, common
+        in the wings of a ToS export, can otherwise hand back a strike
+        nowhere near what was asked for with no indication anything was
+        off-target),
       - no further-OTM strike on the chain passes the liquidity checks
         below (with target_width given, this considers every candidate
         rather than stopping at the first; with target_width=None it
@@ -482,7 +495,7 @@ def build_credit_spread(chain, expiration, side, target_short_delta=0.25, target
         return None
     short_q = min(candidates, key=lambda q: abs(abs(getattr(q, delta_attr)) - target_short_delta))
     achieved_delta = abs(getattr(short_q, delta_attr))
-    if abs(achieved_delta - target_short_delta) > DELTA_TOLERANCE:
+    if abs(achieved_delta - target_short_delta) > DELTA_TOLERANCE_PCT * target_short_delta:
         return None
     short_ba = leg_bid_ask(short_q)
     if short_ba is None or not leg_oi_ok(short_q):
@@ -2379,7 +2392,20 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
     # hard-flagged." This makes it suppressed.
     earnings_date = fetch_next_earnings_date(ticker)
     days_to_earnings = (earnings_date - report_date).days if earnings_date is not None else None
-    earnings_imminent = days_to_earnings is not None and 0 <= days_to_earnings <= 7
+    # The right test is whether earnings falls before the EXPIRATION being
+    # traded, not a fixed 7-day window from today -- a 3rd audit noted
+    # that with only a real chain (min_days=5 in fetch_real_iv_context)
+    # this usually coincides, but a chain with only monthlies could
+    # return a 35-DTE expiration while earnings sits at day 20: the
+    # structure spans the event, days_to_earnings=20>7, and the old check
+    # let it through. Falls back to the 7-day heuristic when there's no
+    # real chain (hence no specific expiration to compare against) --
+    # the volatility-read-reliability concern still applies generically
+    # there, just without a structure's own expiration to anchor it to.
+    if real_iv_context is not None and earnings_date is not None:
+        earnings_imminent = earnings_date <= real_iv_context["expiration"]
+    else:
+        earnings_imminent = days_to_earnings is not None and 0 <= days_to_earnings <= 7
 
     fomc_date = next_fomc_date(report_date)
     days_to_fomc = (fomc_date - report_date).days if fomc_date is not None else None
@@ -2457,8 +2483,10 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
     lines.append(f"Trend regime: {trend_text}")
 
     if earnings_imminent:
+        span_bit = (f" -- before the {real_iv_context['expiration']} expiration this report's "
+                     "structures would use" if real_iv_context is not None else "")
         lines.append(f"EARNINGS WARNING: {ticker} reports on {earnings_date} "
-                      f"({days_to_earnings} day{'s' if days_to_earnings != 1 else ''} away). "
+                      f"({days_to_earnings} day{'s' if days_to_earnings != 1 else ''} away{span_bit}). "
                       "The volatility read above is unreliable heading into a binary event -- "
                       "IV typically rises ahead of earnings while realized vol (what this tool "
                       "measures) does not. Premium-selling structures are suppressed until "
