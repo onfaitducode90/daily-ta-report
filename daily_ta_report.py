@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, date
 
 import numpy as np
 import pandas as pd
+from pandas.tseries.holiday import USFederalHolidayCalendar
 from scipy import stats as scipy_stats
 
 warnings.filterwarnings("ignore")
@@ -21,6 +22,17 @@ try:
 except ImportError:
     print("ERROR: yfinance is required. Install with: pip install yfinance")
     sys.exit(1)
+
+import chart_patterns
+import prediction_log
+import calibrate
+import option_chain
+
+# Horizon (in trading bars) that pattern confidence is calibrated against
+# for display purposes -- see calibrate.py. An arbitrary but fixed choice;
+# changing it invalidates any saved calibration curves until they're
+# refit at the new horizon.
+CALIBRATION_HORIZON = 10
 
 try:
     from zoneinfo import ZoneInfo
@@ -34,13 +46,40 @@ ALL_TICKERS = MARKET_CONTEXT_TICKERS + WATCHLIST
 HISTORY_DAYS = 300
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Position sizing (F28). Only meaningful for the directional (share-based)
+# side of Trade Idea -- an options structure's risk depends on its actual
+# premium/margin, not share count, so sizing there is left to you against
+# the real chain. Update these if your account size or risk rule changes.
+ACCOUNT_SIZE = 230_000
+RISK_PCT_PER_TRADE = 0.01
+
+# Source: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+# (fetched 2026-08-06). Each entry is the SECOND day of the 2-day FOMC
+# meeting -- that's the actual decision/press-conference day that moves
+# markets, not the first day. This is a market-wide event (not per-ticker),
+# so it's checked once for the whole report, not inside analyze_ticker.
+# Hardcoded from the official calendar rather than fetched live because
+# the Fed publishes the full-year schedule well in advance and it doesn't
+# change -- update this list once a year from the source above.
+FOMC_DECISION_DATES_2026 = [
+    date(2026, 1, 28), date(2026, 3, 18), date(2026, 4, 29), date(2026, 6, 17),
+    date(2026, 7, 29), date(2026, 9, 16), date(2026, 10, 28), date(2026, 12, 9),
+]
+
 
 # ---------------------------------------------------------------------------
 # Utility / mode helpers
 # ---------------------------------------------------------------------------
 
 def get_run_mode():
-    """Determine morning/evening/intraday mode based on current ET time."""
+    """Determine morning/evening/intraday mode based on current ET time,
+    and whether "today" is even a trading day (weekday, not a US market
+    holiday). Comparing raw wall-clock time against 09:30/16:00 with no
+    check on whether the market is actually open meant a Saturday run was
+    previously silently labeled "intraday" with no indication the market
+    was closed -- callers should use the returned `is_trading_day` flag to
+    note that rather than presenting the report as if it reflects today's
+    (nonexistent) session."""
     if ET is not None:
         now_et = datetime.now(ET)
     else:
@@ -57,7 +96,14 @@ def get_run_mode():
     else:
         mode = "intraday"
 
-    return mode, now_et
+    is_weekday = now_et.weekday() < 5
+    is_holiday = False
+    if is_weekday:
+        is_holiday = len(_US_HOLIDAY_CALENDAR.holidays(
+            start=now_et.date(), end=now_et.date())) > 0
+    is_trading_day = is_weekday and not is_holiday
+
+    return mode, now_et, is_trading_day
 
 
 def safe_print(*args, **kwargs):
@@ -89,23 +135,28 @@ def fetch_history(ticker, days=HISTORY_DAYS):
 
 
 def fetch_premarket(ticker):
-    """Best-effort attempt to fetch pre-market price data. Returns dict or None."""
+    """Best-effort attempt to fetch pre-market price data. Returns dict or
+    None -- and returns None (never a fallback to unfiltered/wrong-timezone
+    data) whenever the ET conversion or the pre-market time filter can't be
+    trusted. The previous version swallowed a tz_convert failure and ran
+    the "<09:30" filter against whatever timezone the raw data happened to
+    be in (e.g. UTC, which would select ~20:00-05:30 ET -- overnight bars
+    mislabeled as pre-market), and fell all the way through to the FULL
+    session if the filter itself raised. A wrong pre-market price silently
+    presented as real is worse than no pre-market price at all."""
+    if ET is None:
+        return None
     try:
         t = yf.Ticker(ticker)
         df = t.history(period="1d", interval="1m", prepost=True)
         if df is None or df.empty:
             return None
         df.index = pd.to_datetime(df.index)
-        if ET is not None:
-            try:
-                df.index = df.index.tz_convert(ET)
-            except Exception:
-                pass
-        # Filter to pre-market window (before 9:30 ET) if tz info available
         try:
-            premkt = df[df.index.time < datetime.strptime("09:30", "%H:%M").time()]
+            df.index = df.index.tz_convert(ET)
         except Exception:
-            premkt = df
+            return None
+        premkt = df[df.index.time < datetime.strptime("09:30", "%H:%M").time()]
         if premkt.empty:
             return None
         last = premkt.iloc[-1]
@@ -118,27 +169,263 @@ def fetch_premarket(ticker):
         return None
 
 
-def fetch_vix():
+def fetch_intraday_bars(ticker, days=6, interval="5m"):
+    """Real intraday bars (yfinance 5-minute), for a genuine session VWAP
+    and a much finer volume-at-price profile than the daily-bar
+    approximations elsewhere in this report use (Opus audit F33 -- the
+    5-day "VWAP" and 20-day "POC" built from daily OHLCV are still just
+    daily-bar approximations of what are fundamentally intraday concepts).
+    Returns None on any failure -- intraday history is only available for
+    roughly the last 60 days from yfinance, and this endpoint is flakier
+    than the daily one fetch_history uses, so callers must be able to fall
+    back to the daily-bar approximation rather than fail the whole report."""
     try:
-        t = yf.Ticker("^VIX")
-        df = t.history(period="10d", interval="1d")
+        t = yf.Ticker(ticker)
+        df = t.history(period=f"{days}d", interval=interval, prepost=False)
         if df is None or df.empty:
             return None
-        return float(df["Close"].iloc[-1])
+        df.index = pd.to_datetime(df.index)
+        if ET is not None:
+            try:
+                df.index = df.index.tz_convert(ET)
+            except Exception:
+                pass
+        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
+        return df if not df.empty else None
+    except Exception:
+        return None
+
+
+def calc_session_vwap(intraday_df, session_date=None):
+    """Genuine intraday VWAP for ONE trading session: cumulative
+    typical-price*volume / cumulative volume across that session's own
+    real intraday bars, not a daily-bar approximation. Uses the most
+    recent session present in intraday_df unless `session_date` (itself
+    present in the data) is given. Returns (vwap, session_date_used) or
+    (None, None)."""
+    if intraday_df is None or intraday_df.empty:
+        return None, None
+    bar_dates = intraday_df.index.date
+    dates_present = sorted(set(bar_dates))
+    target = session_date if session_date in dates_present else dates_present[-1]
+    session = intraday_df[bar_dates == target]
+    if session.empty or session["Volume"].sum() <= 0:
+        return None, None
+    typical = (session["High"] + session["Low"] + session["Close"]) / 3
+    vwap = (typical * session["Volume"]).sum() / session["Volume"].sum()
+    return float(vwap), target
+
+
+def fetch_vix():
+    """Returns (value, timestamp, is_stale) or (None, None, None). ^VIX has
+    no pre/post session, so requesting 1-minute bars before 09:30 ET
+    silently returns the PREVIOUS session's last minute bar -- indistinguishable
+    from a live quote unless the timestamp is checked. is_stale is True
+    whenever the returned quote is more than 15 minutes old (e.g. a prior
+    close returned outside market hours), so callers can flag it rather
+    than present a stale VIX as if it were live -- this can otherwise
+    classify the volatility regime off a pre-weekend close after a gap
+    event over the weekend."""
+    try:
+        t = yf.Ticker("^VIX")
+        intraday = t.history(period="1d", interval="1m")
+        if intraday is not None and not intraday.empty:
+            ts = intraday.index[-1]
+            value = float(intraday["Close"].iloc[-1])
+        else:
+            df = t.history(period="10d", interval="1d")
+            if df is None or df.empty:
+                return None, None, None
+            ts = df.index[-1]
+            value = float(df["Close"].iloc[-1])
+
+        ts = pd.Timestamp(ts)
+        now = datetime.now(ts.tzinfo) if ts.tzinfo is not None else datetime.now()
+        is_stale = (now - ts.to_pydatetime()) > timedelta(minutes=15)
+        return value, ts, is_stale
     except Exception as e:
         safe_print(f"WARNING: Failed to fetch VIX: {e}")
+        return None, None, None
+
+
+def fetch_next_earnings_date(ticker):
+    """Best-effort next earnings date. Returns a date or None -- yfinance's
+    earnings calendar is not always populated, so absence isn't treated as
+    'no earnings coming', just as 'unknown'."""
+    try:
+        t = yf.Ticker(ticker)
+        cal = t.get_earnings_dates(limit=8)
+        if cal is None or cal.empty:
+            return None
+        now = pd.Timestamp.now(tz=cal.index.tz) if cal.index.tz is not None else pd.Timestamp.now()
+        future = cal[cal.index >= now]
+        if future.empty:
+            return None
+        return future.index.min().date()
+    except Exception:
         return None
+
+
+def fetch_next_dividend_date(ticker):
+    """Best-effort next ex-dividend date, from yfinance's `calendar` field.
+    Returns a date or None. That field has been observed to report the
+    MOST RECENT PAST ex-div date rather than a forward projection (e.g. it
+    kept returning INTC's 2024-08-06 ex-div long after INTC suspended its
+    dividend) -- silently treating a past date as "next" would be wrong,
+    not just missing, so a date is only returned if it's actually in the
+    future relative to `today`."""
+    try:
+        t = yf.Ticker(ticker)
+        cal = t.calendar
+        if not cal:
+            return None
+        ex_div = cal.get("Ex-Dividend Date")
+        if ex_div is None:
+            return None
+        if isinstance(ex_div, datetime):
+            ex_div = ex_div.date()
+        if ex_div <= date.today():
+            return None
+        return ex_div
+    except Exception:
+        return None
+
+
+def fetch_real_iv_context(ticker, hv30_val, min_days=5):
+    """Best-effort REAL implied-volatility read from a locally downloaded
+    ThinkorSwim option-chain snapshot (option_chain.py), for tickers where
+    one exists. Returns None if no chain is available -- callers must fall
+    back to the HV-percentile proxy, never fabricate a number.
+
+    Prefers comparing real IV directly against realized vol (HV30) -- the
+    classic variance-risk-premium framing (premium selling is favorable
+    when IV exceeds what has actually been realized, not just when IV is
+    "high" in some absolute sense) -- over trying to build an IV-rank
+    percentile, since only a handful of daily snapshots exist locally
+    (nowhere near the ~252 trading days a real percentile needs)."""
+    try:
+        chain = option_chain.load_chain(ticker)
+    except Exception:
+        return None
+    if chain is None:
+        return None
+    expiration = chain.nearest_expiration(min_days=min_days)
+    if expiration is None:
+        return None
+    iv = chain.atm_iv(expiration)
+    if iv is None:
+        return None
+    snapshot_date = chain.snapshot_time.date()
+    dte = (expiration - snapshot_date).days
+    return {
+        "chain": chain, "expiration": expiration, "dte": dte, "iv": iv,
+        "snapshot_date": snapshot_date,
+        "iv_minus_hv": (iv - hv30_val) if hv30_val is not None else None,
+    }
+
+
+def build_credit_spread(chain, expiration, side, target_short_delta=0.25):
+    """Pick real strikes for a put or call credit spread from a loaded
+    option chain: the short leg is whichever strike's |delta| is closest
+    to target_short_delta, the long leg is the next strike further
+    out-of-the-money. Returns None (never a fabricated/guessed strike) if
+    delta data isn't populated for this expiration or there's no further
+    strike on the chain to build the long leg from."""
+    quotes = sorted(chain.for_expiration(expiration), key=lambda q: q.strike)
+    if side == "put":
+        delta_attr, mid_attr = "put_delta", "put_mid"
+    elif side == "call":
+        delta_attr, mid_attr = "call_delta", "call_mid"
+    else:
+        raise ValueError(f"side must be 'put' or 'call', got {side!r}")
+
+    candidates = [q for q in quotes if getattr(q, delta_attr) is not None]
+    if not candidates:
+        return None
+    short_q = min(candidates, key=lambda q: abs(abs(getattr(q, delta_attr)) - target_short_delta))
+    idx = quotes.index(short_q)
+    # Further OTM means one strike lower for a put, one strike higher for a call.
+    long_idx = idx - 1 if side == "put" else idx + 1
+    if long_idx < 0 or long_idx >= len(quotes):
+        return None
+    long_q = quotes[long_idx]
+
+    short_mid, long_mid = getattr(short_q, mid_attr), getattr(long_q, mid_attr)
+    if short_mid is None or long_mid is None:
+        return None
+    credit = short_mid - long_mid
+    width = abs(short_q.strike - long_q.strike)
+    if credit <= 0 or width <= 0:
+        return None
+    return {
+        "short_strike": short_q.strike, "long_strike": long_q.strike,
+        "credit": credit, "width": width, "max_loss": width - credit,
+        "short_delta": getattr(short_q, delta_attr),
+    }
+
+
+def check_jade_lizard(chain, expiration, put_spread, target_short_call_delta=0.25):
+    """Given an already-selected bull put spread, check whether swapping
+    its long put for a naked short put and adding a short call spread on
+    top prices out as a true Jade Lizard: upside-riskless requires the
+    total credit collected (naked put + call spread) to be at least the
+    call spread's own width. Returns None if a call spread can't be built
+    from the chain; otherwise returns the numbers either way so the caller
+    can report an honest pass/fail rather than only a pass."""
+    quotes = sorted(chain.for_expiration(expiration), key=lambda q: q.strike)
+    short_put_q = next((q for q in quotes if q.strike == put_spread["short_strike"]), None)
+    if short_put_q is None or short_put_q.put_mid is None:
+        return None
+    call_spread = build_credit_spread(chain, expiration, "call", target_short_call_delta)
+    if call_spread is None:
+        return None
+    total_credit = short_put_q.put_mid + call_spread["credit"]
+    return {
+        "call_short_strike": call_spread["short_strike"],
+        "call_long_strike": call_spread["long_strike"],
+        "call_width": call_spread["width"],
+        "total_credit": total_credit,
+        "verified": total_credit >= call_spread["width"],
+    }
 
 
 # ---------------------------------------------------------------------------
 # Swing structure
 # ---------------------------------------------------------------------------
 
+def _screen_outlier_ranges(df, max_range_atr_mult=5.0):
+    """Cap High/Low for bars whose range is an extreme multiple of a local
+    ATR proxy, for pivot-detection purposes only. A single bad print (a
+    known data-quality issue -- Yahoo/yfinance occasionally returns a
+    spurious spike) can otherwise create a phantom swing pivot that anchors
+    a trendline for the rest of the lookback window, with nothing else in
+    the pipeline positioned to catch it. Returns plain numpy arrays, not a
+    modified DataFrame -- the original df is untouched everywhere else
+    (wick analysis, ATR itself, price displays all still see the real
+    print)."""
+    highs = df["High"].values.copy()
+    lows = df["Low"].values.copy()
+    n = len(df)
+    if n < 15:
+        return highs, lows
+    close = df["Close"].values
+    prev_close = np.r_[close[0], close[:-1]]
+    tr = np.maximum(highs - lows, np.maximum(np.abs(highs - prev_close), np.abs(lows - prev_close)))
+    atr_est = pd.Series(tr).rolling(14, min_periods=5).mean().bfill().values
+    bar_range = highs - lows
+    safe_atr = np.where(atr_est > 0, atr_est, np.inf)
+    outliers = bar_range > max_range_atr_mult * safe_atr
+    if outliers.any():
+        cap = 2 * atr_est
+        highs = np.where(outliers, np.minimum(highs, close + cap), highs)
+        lows = np.where(outliers, np.maximum(lows, close - cap), lows)
+    return highs, lows
+
+
 def find_swings(df, lookback=3):
     """Identify swing highs/lows: bar's high/low is higher/lower than
     `lookback` bars before and after it."""
-    highs = df["High"].values
-    lows = df["Low"].values
+    highs, lows = _screen_outlier_ranges(df)
     n = len(df)
     swing_highs = []  # (index_pos, price)
     swing_lows = []
@@ -182,6 +469,18 @@ def classify_structure(df, lookback_bars=60, swing_lookback=3):
         return "RANGE", "Mixed swing structure", swing_highs, swing_lows
 
 
+def resample_weekly(df):
+    """Resample daily OHLCV bars to weekly (Friday-close) bars, for a
+    genuine higher-timeframe read. What this tool previously called "HTF
+    Trend" was classify_structure run over the last 60 DAILY bars -- fewer
+    bars of the same timeframe, not a higher one (Opus audit F31). The most
+    recent row may be a still-forming partial week."""
+    weekly = df.resample("W-FRI").agg({
+        "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum",
+    }).dropna(subset=["Close"])
+    return weekly
+
+
 # ---------------------------------------------------------------------------
 # Indicators
 # ---------------------------------------------------------------------------
@@ -195,17 +494,28 @@ def sma(series, window):
 
 
 def wilders_smooth(series, period):
-    """Wilder's smoothing: first value = simple average of first `period`
-    values, subsequent = (prior*(period-1) + current) / period."""
+    """Wilder's smoothing: first value = simple average of the first
+    `period` values AFTER any leading NaN run is stripped (a raw
+    np.nanmean(values[:period]) would silently average only period-1 real
+    values whenever the input starts with NaN -- e.g. RSI's gain/loss series
+    from .diff() -- and anchor the seed one bar too early). Interior NaN
+    (rare; e.g. a momentary 0/0 in a DI ratio) is treated as 0 rather than
+    dropped, since dropping it would silently shift every subsequent value's
+    place in the recursion instead of just filling the gap."""
     values = series.values.astype(float)
     n = len(values)
+    first_valid = 0
+    while first_valid < n and np.isnan(values[first_valid]):
+        first_valid += 1
+    usable = np.nan_to_num(values[first_valid:], nan=0.0)
     result = np.full(n, np.nan)
-    if n < period:
+    if len(usable) < period:
         return pd.Series(result, index=series.index)
-    first_avg = np.nanmean(values[:period])
-    result[period - 1] = first_avg
-    for i in range(period, n):
-        result[i] = (result[i - 1] * (period - 1) + values[i]) / period
+    prev = np.mean(usable[:period])
+    result[first_valid + period - 1] = prev
+    for i in range(period, len(usable)):
+        prev = (prev * (period - 1) + usable[i]) / period
+        result[first_valid + i] = prev
     return pd.Series(result, index=series.index)
 
 
@@ -247,7 +557,6 @@ def calc_macd(close, fast=12, slow=26, signal=9):
 def calc_adx(df, period=14):
     high = df["High"]
     low = df["Low"]
-    close = df["Close"]
 
     prev_high = high.shift(1)
     prev_low = low.shift(1)
@@ -271,7 +580,13 @@ def calc_adx(df, period=14):
     minus_di = 100 * smoothed_minus_dm / smoothed_tr.replace(0, np.nan)
 
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    adx = wilders_smooth(dx.fillna(0), period)
+    # dx is NaN for its own ~2*period leading bars (it's derived from the
+    # Wilder-smoothed +DM/-DM/TR, which are themselves NaN until their seed
+    # position). fillna(0) used to convert that entire lead-in into
+    # fabricated zero DX readings and seed ADX's own smoothing from them --
+    # wilders_smooth now strips a genuine leading NaN run itself, so ADX
+    # seeds from the first real DX values instead of manufactured zeros.
+    adx = wilders_smooth(dx, period)
 
     return adx, plus_di, minus_di
 
@@ -347,27 +662,81 @@ def calc_rolling_vwap(df, window=5):
     return float(vwap)
 
 
-def calc_volume_poc(df, window=20, bins=20):
+def calc_volume_poc(df, window=20, atr_val=None, bins=None):
+    """Volume point-of-control. Each bar's volume is distributed
+    PROPORTIONALLY across every bin its High-Low range overlaps (assuming
+    volume is spread uniformly across the bar's range -- still an
+    approximation with daily bars, since we don't have intraday
+    volume-at-price, but a real distribution rather than the previous
+    behavior of dumping 100% of a bar's volume into whichever single bin
+    happened to contain its typical price).
+
+    Bin count is sized so each bin is roughly 0.3 ATR wide when `atr_val` is
+    given -- finer bins just chase daily noise, coarser ones wash out any
+    real concentration. Falls back to a fixed 20 bins if no ATR is
+    available. An explicit `bins` always overrides both."""
     sub = df.tail(window)
     if sub.empty:
         return None
     price_min = sub["Low"].min()
     price_max = sub["High"].max()
-    if price_max <= price_min:
+    price_range = price_max - price_min
+    if price_range <= 0:
         return float(price_max)
+
+    if bins is None:
+        if atr_val is not None and atr_val > 0:
+            bin_width = 0.3 * atr_val
+            bins = max(int(round(price_range / bin_width)), 5)
+        else:
+            bins = 20
+
     bin_edges = np.linspace(price_min, price_max, bins + 1)
     bin_volumes = np.zeros(bins)
 
     for _, row in sub.iterrows():
-        # distribute bar's volume across bins it overlaps (typical price approx)
-        typical = (row["High"] + row["Low"] + row["Close"]) / 3
-        bin_idx = np.searchsorted(bin_edges, typical, side="right") - 1
-        bin_idx = min(max(bin_idx, 0), bins - 1)
-        bin_volumes[bin_idx] += row["Volume"]
+        low, high, vol = row["Low"], row["High"], row["Volume"]
+        if high <= low:
+            idx = min(max(int(np.searchsorted(bin_edges, low, side="right")) - 1, 0), bins - 1)
+            bin_volumes[idx] += vol
+            continue
+        overlap_lo = np.maximum(bin_edges[:-1], low)
+        overlap_hi = np.minimum(bin_edges[1:], high)
+        overlap = np.clip(overlap_hi - overlap_lo, 0, None)
+        bin_volumes += (overlap / (high - low)) * vol
 
     max_bin = int(np.argmax(bin_volumes))
     poc = (bin_edges[max_bin] + bin_edges[max_bin + 1]) / 2
     return float(poc)
+
+
+def calc_beta_correlation(ticker_df, spy_df, window=63):
+    """Rolling correlation and beta of this ticker's daily returns against
+    SPY's, over the trailing `window` (default ~1 quarter) trading days
+    both series actually have in common. Distinguishes an idiosyncratic,
+    name-specific move from a market-wide one riding on the same tape
+    (Opus audit F32) -- a high-|correlation| bullish/bearish read is more
+    "long/short the market" than "long/short this name". Returns None if
+    either series is missing or there isn't enough overlapping history."""
+    if ticker_df is None or spy_df is None:
+        return None
+    t_ret = ticker_df["Close"].pct_change().dropna()
+    s_ret = spy_df["Close"].pct_change().dropna()
+    t_ret.index = t_ret.index.date
+    s_ret.index = s_ret.index.date
+    joined = pd.concat([t_ret, s_ret], axis=1, join="inner").tail(window)
+    joined.columns = ["ticker", "spy"]
+    joined = joined.dropna()
+    if len(joined) < 20:
+        return None
+    corr = joined["ticker"].corr(joined["spy"])
+    var_spy = joined["spy"].var()
+    if not var_spy or np.isnan(var_spy):
+        return None
+    beta = joined["ticker"].cov(joined["spy"]) / var_spy
+    if np.isnan(corr) or np.isnan(beta):
+        return None
+    return {"correlation": float(corr), "beta": float(beta), "n": len(joined)}
 
 
 def calc_hv(close, window=30, annualize=252):
@@ -395,57 +764,32 @@ def calc_iv_rank(close, window=30, lookback=252):
     return float(rank)
 
 
+_US_HOLIDAY_CALENDAR = USFederalHolidayCalendar()
+
+
 def days_until_next_friday(from_date):
-    days_ahead = (4 - from_date.weekday()) % 7  # Friday = weekday 4
-    if days_ahead == 0:
-        days_ahead = 7  # next Friday, not today
-    return days_ahead
+    """TRADING days from `from_date` (exclusive) through the next Friday
+    (inclusive). The caller scales volatility by sqrt(this), a trading-day
+    convention -- returning calendar days instead overstated the expected
+    move by 18% when run on a Friday and 9.5% on a Saturday, since a
+    calendar-day count includes weekend days with no price movement to
+    scale for. US federal holidays are used as a market-holiday proxy; this
+    is not perfectly NYSE-accurate (e.g. it includes Columbus Day, which
+    NYSE does not observe, and omits Good Friday, which NYSE does) but is a
+    large improvement over pure calendar days with no new dependency."""
+    calendar_days_ahead = (4 - from_date.weekday()) % 7  # Friday = weekday 4
+    if calendar_days_ahead == 0:
+        calendar_days_ahead = 7  # next Friday, not today
+    next_friday = from_date + timedelta(days=calendar_days_ahead)
+    bdays = pd.bdate_range(start=from_date + timedelta(days=1), end=next_friday)
+    holidays = _US_HOLIDAY_CALENDAR.holidays(start=from_date, end=next_friday)
+    trading_days = bdays[~bdays.isin(holidays)]
+    return max(len(trading_days), 1)
 
 
 # ---------------------------------------------------------------------------
 # Candle pattern recognition
 # ---------------------------------------------------------------------------
-
-def detect_engulfing(df):
-    if len(df) < 2:
-        return None
-    today = df.iloc[-1]
-    yday = df.iloc[-2]
-    if today["Open"] < yday["Close"] and today["Close"] > yday["Open"]:
-        return "Bullish engulfing"
-    if today["Open"] > yday["Close"] and today["Close"] < yday["Open"]:
-        return "Bearish engulfing"
-    return None
-
-
-def detect_pin_bar(df):
-    if len(df) < 1:
-        return None
-    row = df.iloc[-1]
-    body = abs(row["Close"] - row["Open"])
-    lower_wick = min(row["Open"], row["Close"]) - row["Low"]
-    upper_wick = row["High"] - max(row["Open"], row["Close"])
-    if body == 0:
-        body = 1e-9
-    if lower_wick > 2 * body and upper_wick < 0.5 * body:
-        return "Hammer"
-    if upper_wick > 2 * body and lower_wick < 0.5 * body:
-        return "Shooting star"
-    return None
-
-
-def detect_doji(df):
-    if len(df) < 1:
-        return None
-    row = df.iloc[-1]
-    body = abs(row["Close"] - row["Open"])
-    total_range = row["High"] - row["Low"]
-    if total_range == 0:
-        return None
-    if body < 0.10 * total_range:
-        return "Doji"
-    return None
-
 
 def detect_inside_bars(df):
     """Return count of consecutive inside bars ending at the most recent bar."""
@@ -522,35 +866,51 @@ def detect_break_and_retest(df, levels):
     return results if results else None
 
 
-def rsi_divergence(df, rsi_series, lookback=10):
-    if len(df) < lookback or rsi_series.dropna().shape[0] < lookback:
+def rsi_divergence(df, rsi_series, lookback_bars=60, swing_lookback=3,
+                    min_pivot_gap=5, min_rsi_gap=8.0, max_pivot_age=10):
+    """Classical divergence compares RSI at CONFIRMED swing pivots, not
+    today's bar against a running N-bar extreme -- the old approach fired
+    on any marginal new high/low regardless of whether a real pivot
+    structure existed, and mixed an intraday High/Low price series against
+    a Close-based RSI reading from a different bar.
+
+    Just switching to swing pivots was NOT enough on its own -- tested
+    against synthetic no-pattern (pure random walk) data, two adjacent
+    pivots showing SOME divergence by pure chance turned out to be common
+    (~22% of days), actually worse than the original bug's ~11%. Two
+    additional filters, both empirically tuned against that same synthetic
+    no-signal test until the false-fire rate reached the low single digits
+    the audit predicted:
+      - `min_rsi_gap`: the RSI reading at the two pivots must differ by a
+        real amount, not just be marginally different (noise).
+      - `max_pivot_age`: the second pivot must be recent (within this many
+        bars of the most recent bar) -- a "divergence" anchored on a stale
+        pivot from well in the past isn't a live signal for today."""
+    sub = df.tail(lookback_bars) if len(df) > lookback_bars else df
+    if len(sub) < (swing_lookback * 2 + 1) * 2:
         return None
-    sub_close = df["Close"].tail(lookback)
-    sub_high = df["High"].tail(lookback)
-    sub_low = df["Low"].tail(lookback)
-    sub_rsi = rsi_series.tail(lookback)
-
-    price_hh_idx = sub_high.values.argmax()
-    price_ll_idx = sub_low.values.argmin()
-
-    # Compare most recent high/low vs the max/min excluding last bar for simple divergence check
-    last_price_high = sub_high.iloc[-1]
-    last_rsi_at_high = sub_rsi.iloc[-1]
-    prior_max_high = sub_high.iloc[:-1].max()
-    prior_max_high_idx = sub_high.iloc[:-1].values.argmax()
-    prior_rsi_at_high = sub_rsi.iloc[:-1].iloc[prior_max_high_idx]
-
-    last_price_low = sub_low.iloc[-1]
-    last_rsi_at_low = sub_rsi.iloc[-1]
-    prior_min_low = sub_low.iloc[:-1].min()
-    prior_min_low_idx = sub_low.iloc[:-1].values.argmin()
-    prior_rsi_at_low = sub_rsi.iloc[:-1].iloc[prior_min_low_idx]
+    swing_highs, swing_lows = find_swings(sub, lookback=swing_lookback)
+    sub_rsi = rsi_series.reindex(sub.index)
+    last_pos = len(sub) - 1
 
     findings = []
-    if last_price_high > prior_max_high and last_rsi_at_high < prior_rsi_at_high:
-        findings.append("Bearish divergence — price higher high, RSI lower high")
-    if last_price_low < prior_min_low and last_rsi_at_low > prior_rsi_at_low:
-        findings.append("Bullish divergence — price lower low, RSI higher low")
+
+    if len(swing_highs) >= 2:
+        (i1, p1), (i2, p2) = swing_highs[-2], swing_highs[-1]
+        if i2 - i1 >= min_pivot_gap and (last_pos - i2) <= max_pivot_age:
+            rsi1, rsi2 = sub_rsi.iloc[i1], sub_rsi.iloc[i2]
+            if (not (np.isnan(rsi1) or np.isnan(rsi2)) and p2 > p1
+                    and (rsi1 - rsi2) >= min_rsi_gap):
+                findings.append("Bearish divergence — price higher high, RSI lower high")
+
+    if len(swing_lows) >= 2:
+        (i1, p1), (i2, p2) = swing_lows[-2], swing_lows[-1]
+        if i2 - i1 >= min_pivot_gap and (last_pos - i2) <= max_pivot_age:
+            rsi1, rsi2 = sub_rsi.iloc[i1], sub_rsi.iloc[i2]
+            if (not (np.isnan(rsi1) or np.isnan(rsi2)) and p2 < p1
+                    and (rsi2 - rsi1) >= min_rsi_gap):
+                findings.append("Bullish divergence — price lower low, RSI higher low")
+
     return findings if findings else None
 
 
@@ -570,7 +930,135 @@ def fmt_price(value):
     return f"${value:.2f}"
 
 
-def build_market_context_section(vix_value, spy_trend_line, qqq_trend_line):
+def build_portfolio_section(portfolio_infos):
+    """Aggregate directional bias and volatility stance across every
+    watchlist ticker that actually had enough data to analyze, and flag
+    when the watchlist isn't offering independent ideas -- several
+    correlated names all leaning the same direction is one concentrated
+    bet wearing multiple tickers' names, not several separate
+    opportunities. This can't see actual portfolio-level correlation
+    between the watchlist names themselves (that needs real position/
+    sector data this tool doesn't have) -- but it does have each name's
+    real correlation to SPY (F32, calc_beta_correlation), which is
+    appended to the flag below as a partial, honest substitute: it
+    can't prove NVDA and SPCX move together, but it can show whether
+    each is itself mostly a market bet."""
+    lines = []
+    usable = [p for p in portfolio_infos if p is not None]
+    if not usable:
+        lines.append("No tickers had enough data to include in the portfolio view.")
+        return lines
+
+    bullish = [p for p in usable if p["direction"] > 0 and p["sufficient_evidence"]]
+    bearish = [p for p in usable if p["direction"] < 0 and p["sufficient_evidence"]]
+    no_edge = [p for p in usable if not (p["sufficient_evidence"] and p["direction"] != 0)]
+
+    lines.append(f"Watchlist: {len(usable)} ticker(s) analyzed — "
+                 f"{len(bullish)} bullish, {len(bearish)} bearish, {len(no_edge)} no clear edge.")
+
+    def spy_corr_bit(group):
+        known = [p for p in group if p.get("spy_correlation") is not None]
+        if not known:
+            return ""
+        corr_text = ", ".join(f"{p['ticker']} {p['spy_correlation']:+.2f}" for p in known)
+        avg_abs = np.mean([abs(p["spy_correlation"]) for p in known])
+        market_bit = (" -- mostly market beta, not independent ideas" if avg_abs > 0.6
+                       else " -- more idiosyncratic than a pure market bet" if avg_abs < 0.3 else "")
+        return f" vs-SPY correlation: {corr_text}{market_bit}."
+
+    flagged = False
+    if len(bullish) >= 2:
+        names = ", ".join(p["ticker"] for p in bullish)
+        lines.append(f"CONCENTRATION: {names} are ALL bullish today. If these names are "
+                      "correlated (same sector, same factor exposure), this is one directional "
+                      f"bet sized across several tickers, not several independent ideas.{spy_corr_bit(bullish)}")
+        flagged = True
+    if len(bearish) >= 2:
+        names = ", ".join(p["ticker"] for p in bearish)
+        lines.append(f"CONCENTRATION: {names} are ALL bearish today. Same caveat as "
+                      f"above.{spy_corr_bit(bearish)}")
+        flagged = True
+
+    sell_prem = [p["ticker"] for p in usable if p["vol_stance"] == "sell premium"]
+    buy_prem = [p["ticker"] for p in usable if p["vol_stance"] == "buy premium"]
+    if len(sell_prem) >= 2:
+        lines.append(f"VOLATILITY CONCENTRATION: {', '.join(sell_prem)} all show a volatility "
+                      "read favoring selling premium. Short-vega positions across correlated "
+                      "names add up to one larger short-vol bet, not independent trades.")
+        flagged = True
+    if len(buy_prem) >= 2:
+        lines.append(f"VOLATILITY CONCENTRATION: {', '.join(buy_prem)} all show a volatility "
+                      "read favoring buying premium (long vega across these names).")
+        flagged = True
+
+    earnings_soon = [p["ticker"] for p in usable if p["earnings_soon"]]
+    if earnings_soon:
+        lines.append(f"EARNINGS THIS WEEK: {', '.join(earnings_soon)} — the volatility read for "
+                      "these names is unreliable heading into the event (see their Trade Idea sections).")
+        flagged = True
+
+    if not flagged:
+        lines.append("No concentration flags today — directional and volatility reads are "
+                      "reasonably spread out across the watchlist.")
+
+    return lines
+
+
+def parse_price(text):
+    """Inverse of fmt_price -- needed to compute risk/reward from a
+    PatternMatch's already-formatted price_target string."""
+    if not text or text == "N/A":
+        return None
+    try:
+        return float(str(text).replace("$", "").replace(",", ""))
+    except ValueError:
+        return None
+
+
+def pivot_age_sessions(df, formed_date_str):
+    """How many trading sessions ago a pattern's anchor pivot was, given
+    the full history `df` and the pattern's `formed_date` string. Swing
+    pivots need lookback bars confirmed on both sides, so the freshest
+    possible anchor is always a few sessions old -- that lag is invisible
+    unless surfaced explicitly, and "Confirmed" can otherwise read as if it
+    means "as of right now" when the anchor may be a week or more stale."""
+    try:
+        formed_date = pd.Timestamp(formed_date_str).date()
+        matches = df.index[df.index.date == formed_date]
+        if len(matches) == 0:
+            return None
+        pos = df.index.get_loc(matches[0])
+        return len(df) - 1 - pos
+    except Exception:
+        return None
+
+
+def quality_text(confidence):
+    """Ordinal quality tier, plus a calibrated historical hit rate when one
+    has actually been fit and is statistically distinguishable from noise
+    (see calibrate.py) -- never fabricates a number when calibration isn't
+    available or isn't significant yet."""
+    tier = chart_patterns.confidence_tier(confidence)
+    calibration = calibrate.remap_confidence(confidence, horizon=CALIBRATION_HORIZON)
+    if calibration is None:
+        return tier
+    if not calibration["significant"]:
+        return f"{tier} (calibration not yet significant at n={calibration['n']})"
+    reliability = "" if calibration["reliable"] else f", provisional n={calibration['n']}"
+    return f"{tier} (calibrated ~{calibration['calibrated_pct']:.0f}% historical hit rate{reliability})"
+
+
+def next_fomc_date(today):
+    """Next FOMC rate-decision date on/after `today`, from the hardcoded
+    FOMC_DECISION_DATES_2026 list. Returns None once past the last date in
+    that list (i.e. this needs a yearly refresh from the source cited
+    above it) -- never estimates or guesses a date beyond what's verified."""
+    upcoming = [d for d in FOMC_DECISION_DATES_2026 if d >= today]
+    return min(upcoming) if upcoming else None
+
+
+def build_market_context_section(vix_value, vix_timestamp, vix_is_stale, spy_trend_line,
+                                  qqq_trend_line, report_date=None):
     lines = []
     if vix_value is not None:
         if vix_value < 15:
@@ -581,11 +1069,26 @@ def build_market_context_section(vix_value, spy_trend_line, qqq_trend_line):
             regime = "Elevated volatility — premium selling favored"
         else:
             regime = "Crisis volatility — reduce size, be cautious"
-        lines.append(f"VIX: {vix_value:.1f} — {regime}")
+        stale_bit = " [STALE — >15 min old, treat as last known, not live]" if vix_is_stale else ""
+        ts_bit = f" (as of {vix_timestamp.strftime('%Y-%m-%d %H:%M %Z')})" if vix_timestamp is not None else ""
+        lines.append(f"VIX: {vix_value:.1f} — {regime}{stale_bit}{ts_bit}")
     else:
         lines.append("VIX: N/A — data unavailable")
     lines.append(spy_trend_line)
     lines.append(qqq_trend_line)
+
+    if report_date is not None:
+        fomc_date = next_fomc_date(report_date)
+        if fomc_date is not None:
+            days_to_fomc = (fomc_date - report_date).days
+            if 0 <= days_to_fomc <= 7:
+                lines.append(f"FOMC WARNING: Fed rate decision on {fomc_date} "
+                              f"({days_to_fomc} day{'s' if days_to_fomc != 1 else ''} away) -- a "
+                              "market-wide event, not ticker-specific. Expect IV to run up into it "
+                              "and crush after; every ticker's volatility read above is unreliable "
+                              "until it's past.")
+            else:
+                lines.append(f"Next FOMC decision: {fomc_date}.")
     return lines
 
 
@@ -597,8 +1100,180 @@ def analyze_market_ticker(ticker, df):
     return f"{ticker}: {trend} — {detail}"
 
 
-def analyze_ticker(ticker, df, mode, report_date, premarket_data=None):
-    """Build the full multi-section report text for a single watchlist ticker."""
+def collapse_family(label, family_signals, weight_cap, coverage_denominator=None):
+    """Collapse every signal in a correlated family into ONE vote:
+    direction is the family's net lean, weight reflects how lopsided that
+    lean is (scaled to weight_cap), and -- when `coverage_denominator` is
+    given -- further scaled down when only a fraction of the family's
+    possible indicators actually had data (a lean built on 1 of 5 possible
+    trend indicators shouldn't carry the same weight as one built on all
+    5, even if the 1 available indicator is one-sided)."""
+    if not family_signals:
+        return None
+    bull = sum(w for _, d, w, _ in family_signals if d > 0)
+    bear = sum(w for _, d, w, _ in family_signals if d < 0)
+    total = bull + bear
+    if total == 0:
+        return None
+    lean = (bull - bear) / total
+    direction = 1 if lean > 0 else -1
+    weight = abs(lean) * weight_cap
+    if coverage_denominator:
+        weight *= min(len(family_signals) / coverage_denominator, 1.0)
+    agreeing = sorted([s for s in family_signals if s[1] == direction], key=lambda s: -s[2])
+    top_notes = "; ".join(n[3] for n in agreeing[:2])
+    note = (f"{top_notes} ({len(agreeing)}/{len(family_signals)} {label.lower()} signals agree)"
+            if len(family_signals) > 1 else top_notes)
+    return (label, direction, weight, note)
+
+
+FAMILY_WEIGHT_CAP = 4.0
+TREND_FAMILY_SIZE = 6  # Swing structure (daily), Weekly structure, 200 SMA, MACD, ADX/DI, Momentum
+# With only 2 possible families, a single family's vote alone can reach at
+# most FAMILY_WEIGHT_CAP. Setting the floor just above that means a
+# directional call structurally REQUIRES both families to be present and
+# to agree (partially or fully) -- one family voting alone, however
+# lopsided, can never clear this floor by construction.
+MIN_CONFLUENCE_WEIGHT = 4.5
+
+
+def compute_confluence(df, pattern_matches):
+    """Self-contained confluence computation: given a daily OHLCV history
+    and the chart patterns already detected for it (chart_patterns.detect_all),
+    returns the same signals/net/weights the live report's Plain English
+    Summary is built from. Deliberately self-contained -- it recomputes
+    trend/SMA/MACD/ADX/momentum internally, redundant with what
+    analyze_ticker's other sections already compute for DISPLAY, but these
+    are cheap pure functions of df -- so this exact logic can be called
+    directly against a historical slice by a backtest, rather than the
+    backtest needing to hand-reimplement it and risk silently drifting out
+    of sync with whatever the live report actually does.
+
+    Returns a dict: signals, net, bull_weight, bear_weight, total_weight,
+    sufficient_evidence, trend, has_min_data."""
+    has_min_data = len(df) >= 30
+    current_price = float(df["Close"].iloc[-1])
+
+    trend = "RANGE"
+    if has_min_data:
+        trend, _, _, _ = classify_structure(df, lookback_bars=min(60, len(df)), swing_lookback=3)
+
+    # A genuine higher-timeframe read (F31) -- the "trend" above is 60
+    # DAILY bars, still a daily-timeframe read, just a shorter window of it.
+    weekly_trend = None
+    weekly_df = resample_weekly(df)
+    if len(weekly_df) >= 15:
+        weekly_trend, _, _, _ = classify_structure(
+            weekly_df, lookback_bars=min(60, len(weekly_df)), swing_lookback=2)
+
+    sma200 = sma(df["Close"], 200)
+
+    macd_status = None
+    if len(df) >= 35:
+        macd_line, signal_line, _ = calc_macd(df["Close"])
+        macd_status = "Bullish" if macd_line.iloc[-1] > signal_line.iloc[-1] else "Bearish"
+
+    adx_val = plus_di_val = minus_di_val = None
+    if len(df) >= 30:
+        adx_series, plus_di_series, minus_di_series = calc_adx(df, 14)
+        if not np.isnan(adx_series.iloc[-1]):
+            adx_val = float(adx_series.iloc[-1])
+            plus_di_val = float(plus_di_series.iloc[-1])
+            minus_di_val = float(minus_di_series.iloc[-1])
+
+    mom_dir_positive = mom_dir_negative = mom_dir_rising = mom_dir_falling = False
+    if len(df) >= 25:
+        squeeze_data = calc_ttm_squeeze(df)
+        ms = squeeze_data["momentum"]
+        if not ms.dropna().empty:
+            mc = ms.iloc[-1]
+            mp = ms.iloc[-2] if len(ms) >= 2 else np.nan
+            mom_current = float(mc) if not np.isnan(mc) else None
+            mom_prev = float(mp) if not np.isnan(mp) else None
+            mom_dir_positive = mom_current is not None and mom_current > 0
+            mom_dir_negative = mom_current is not None and mom_current < 0
+            mom_dir_rising = mom_current is not None and mom_prev is not None and mom_current > mom_prev
+            mom_dir_falling = mom_current is not None and mom_prev is not None and mom_current < mom_prev
+
+    trend_indicator_signals = []
+    if has_min_data:
+        if trend == "UPTREND":
+            trend_indicator_signals.append(("Swing structure (daily)", 1, 3.0, "the daily swing structure is an uptrend (HH+HL)"))
+        elif trend == "DOWNTREND":
+            trend_indicator_signals.append(("Swing structure (daily)", -1, 3.0, "the daily swing structure is a downtrend (LH+LL)"))
+
+    if weekly_trend == "UPTREND":
+        trend_indicator_signals.append(("Weekly structure", 1, 3.0, "the WEEKLY structure is an uptrend (HH+HL) -- a real higher timeframe, not just fewer daily bars"))
+    elif weekly_trend == "DOWNTREND":
+        trend_indicator_signals.append(("Weekly structure", -1, 3.0, "the WEEKLY structure is a downtrend (LH+LL) -- a real higher timeframe, not just fewer daily bars"))
+
+    if len(df) >= 200 and not np.isnan(sma200.iloc[-1]):
+        above_200 = current_price > sma200.iloc[-1]
+        trend_indicator_signals.append(("200 SMA", 1 if above_200 else -1, 2.0,
+                         f"price is {'above' if above_200 else 'below'} the 200-day SMA"))
+
+    if macd_status is not None:
+        trend_indicator_signals.append(("MACD", 1 if macd_status == "Bullish" else -1, 2.0,
+                         f"MACD is {macd_status.lower()}"))
+
+    if adx_val is not None and plus_di_val is not None:
+        di_dir = 1 if plus_di_val > minus_di_val else -1
+        di_weight = 2.0 if adx_val > 25 else 1.0
+        di_note = (f"ADX {adx_val:.0f} confirms a trending tape with "
+                   f"{'+DI' if di_dir > 0 else '-DI'} in control") if adx_val > 25 else \
+                  (f"ADX {adx_val:.0f} (ranging) with "
+                   f"{'+DI' if di_dir > 0 else '-DI'} slightly ahead")
+        trend_indicator_signals.append(("ADX/DI", di_dir, di_weight, di_note))
+
+    if mom_dir_positive:
+        mom_weight = 2.0 if mom_dir_rising else 1.0
+        mom_note = "momentum is positive and rising" if mom_dir_rising else "momentum is positive but fading"
+        trend_indicator_signals.append(("Momentum", 1, mom_weight, mom_note))
+    elif mom_dir_negative:
+        mom_weight = 2.0 if mom_dir_falling else 1.0
+        mom_note = "momentum is negative and falling" if mom_dir_falling else "momentum is negative but improving"
+        trend_indicator_signals.append(("Momentum", -1, mom_weight, mom_note))
+
+    pattern_signals = []
+    for pm in pattern_matches:
+        if pm.bias == "Neutral":
+            continue
+        base_dir = 1 if pm.bias == "Bullish" else -1
+        if pm.status == "Invalidated":
+            direction, weight = -base_dir, 2.5
+            note = f"{pm.name} failed against its {pm.bias.lower()} bias — often a reversal tell"
+        elif pm.status == "Confirmed":
+            direction, weight = base_dir, 3.0
+            note = f"{pm.name} is confirmed"
+        else:
+            direction, weight = base_dir, 1.5
+            note = f"{pm.name} is forming (not yet confirmed)"
+        pattern_signals.append((pm.name, direction, weight, note))
+
+    trend_vote = collapse_family("Trend/Momentum", trend_indicator_signals,
+                                  FAMILY_WEIGHT_CAP, coverage_denominator=TREND_FAMILY_SIZE)
+    pattern_vote = collapse_family("Pattern geometry", pattern_signals, FAMILY_WEIGHT_CAP)
+    signals = [v for v in (trend_vote, pattern_vote) if v is not None]
+
+    bull_weight = sum(w for _, d, w, _ in signals if d > 0)
+    bear_weight = sum(w for _, d, w, _ in signals if d < 0)
+    total_weight = bull_weight + bear_weight
+    net = (bull_weight - bear_weight) / total_weight if total_weight > 0 else 0.0
+    sufficient_evidence = total_weight >= MIN_CONFLUENCE_WEIGHT and len(signals) >= 2
+
+    return {
+        "signals": signals, "net": net, "bull_weight": bull_weight, "bear_weight": bear_weight,
+        "total_weight": total_weight, "sufficient_evidence": sufficient_evidence,
+        "trend": trend, "has_min_data": has_min_data,
+    }
+
+
+def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=None):
+    """Build the full multi-section report text for a single watchlist
+    ticker. Returns (report_text, portfolio_info) -- portfolio_info is a
+    dict of the facts the PORTFOLIO VIEW section (built once, after every
+    ticker has been analyzed) needs to aggregate across the watchlist, or
+    None if this ticker couldn't be analyzed at all."""
     lines = []
     lines.append("=" * 60)
     lines.append(f"{ticker}")
@@ -606,11 +1281,10 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None):
 
     if df is None or df.empty:
         lines.append("WARNING: No data available for this ticker — skipping.")
-        return "\n".join(lines)
+        return "\n".join(lines), None
 
     min_days_required = 30
     has_min_data = len(df) >= min_days_required
-    has_full_data = len(df) >= 60
 
     if ticker == "SPCX" and len(df) < 60:
         lines.append(f"NOTE: SPCX has only {len(df)} trading days of history — "
@@ -633,9 +1307,21 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None):
     lines.append("")
     lines.append("--- MARKET STRUCTURE ---")
     if has_min_data:
-        trend, detail, swing_highs, swing_lows = classify_structure(
+        trend, detail, _, _ = classify_structure(
             df, lookback_bars=min(60, len(df)), swing_lookback=3)
-        lines.append(f"HTF Trend: {trend} — {detail}")
+        lines.append(f"Daily swing structure (60 bars): {trend} — {detail}")
+
+        weekly_df = resample_weekly(df)
+        if len(weekly_df) >= 15:
+            weekly_trend_disp, weekly_detail, _, _ = classify_structure(
+                weekly_df, lookback_bars=min(60, len(weekly_df)), swing_lookback=2)
+            weekly_partial_bit = (" (most recent weekly bar is still forming)"
+                                   if weekly_df.index[-1].date() > df.index[-1].date() else "")
+            lines.append(f"Weekly Trend (real higher timeframe): {weekly_trend_disp} — "
+                          f"{weekly_detail}{weekly_partial_bit}")
+        else:
+            lines.append("Weekly Trend: Insufficient data (need 15+ weekly bars)")
+
         if trend == "UPTREND":
             bias = "Long bias"
         elif trend == "DOWNTREND":
@@ -645,8 +1331,23 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None):
         lines.append(f"Market bias: {bias}")
     else:
         trend, bias = "RANGE", "Neutral"
-        lines.append("HTF Trend: Insufficient data")
+        lines.append("Daily swing structure: Insufficient data")
+        lines.append("Weekly Trend: Insufficient data")
         lines.append("Market bias: Neutral")
+
+    beta_ctx = calc_beta_correlation(df, spy_df)
+    if beta_ctx is not None:
+        abs_corr = abs(beta_ctx["correlation"])
+        if abs_corr > 0.7:
+            read = "tightly tracking the broad market -- today's setup may be more a leveraged market bet than a name-specific edge"
+        elif abs_corr > 0.3:
+            read = "loosely correlated with the broad market -- part market, part name-specific"
+        else:
+            read = "largely independent of the broad market right now -- more idiosyncratic than a pure market bet"
+        lines.append(f"vs SPY ({beta_ctx['n']}d): correlation {beta_ctx['correlation']:+.2f}, "
+                      f"beta {beta_ctx['beta']:.2f} — {ticker} is {read}.")
+    else:
+        lines.append("vs SPY: Insufficient overlapping history to compute correlation/beta.")
 
     # ---------------- SECTION 3: Key Technical Zones ----------------
     lines.append("")
@@ -696,7 +1397,6 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None):
         rel = "above" if current_price > val else "below"
         lines.append(f"21-day EMA: {fmt_price(val)} — price {rel}")
     else:
-        val21 = None
         lines.append("21-day EMA: Insufficient data")
 
     if len(df) >= 9 and not np.isnan(ema9.iloc[-1]):
@@ -733,22 +1433,43 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None):
         if not golden_cross and not death_cross:
             lines.append("Golden/Death cross: None in last 20 days")
 
+    # Real intraday bars (F33), fetched once and reused for both the
+    # session VWAP and a finer volume-at-price profile below -- None if
+    # unavailable, in which case both fall back to the daily-bar-only
+    # approximations that already existed.
+    intraday_df = fetch_intraday_bars(ticker)
+
     # Rolling VWAP
     if len(df) >= 5:
         vwap5 = calc_rolling_vwap(df, window=5)
-        lines.append(f"5-day VWAP: {fmt_price(vwap5)} — price "
+        lines.append(f"5-day VWAP (daily-bar approx): {fmt_price(vwap5)} — price "
                       f"{'above' if current_price > vwap5 else 'below'} "
                       f"({fmt_pct((current_price - vwap5) / vwap5 * 100)})")
     else:
         lines.append("5-day VWAP: Insufficient data")
 
+    session_vwap, session_vwap_date = calc_session_vwap(intraday_df)
+    if session_vwap is not None:
+        lines.append(f"Session VWAP ({session_vwap_date}, real intraday bars): {fmt_price(session_vwap)} "
+                      f"— price {'above' if current_price > session_vwap else 'below'} "
+                      f"({fmt_pct((current_price - session_vwap) / session_vwap * 100)})")
+
     # Volume POC
     if len(df) >= 20:
-        poc = calc_volume_poc(df, window=20, bins=20)
-        lines.append(f"Volume POC: {fmt_price(poc)} — highest volume concentration")
+        poc_atr = calc_atr(df, 14).iloc[-1]
+        poc_atr = float(poc_atr) if not np.isnan(poc_atr) else None
+        poc = calc_volume_poc(df, window=20, atr_val=poc_atr)
+        lines.append(f"Volume POC (20-day, daily-bar approx): {fmt_price(poc)} — highest volume concentration")
     else:
         poc = None
+        poc_atr = None
         lines.append("Volume POC: Insufficient data")
+
+    if intraday_df is not None and len(intraday_df) >= 30:
+        intraday_poc = calc_volume_poc(intraday_df, window=len(intraday_df), atr_val=poc_atr, bins=100)
+        n_sessions = len(set(intraday_df.index.date))
+        lines.append(f"Volume POC ({n_sessions}-session, real intraday bars): {fmt_price(intraday_poc)} "
+                      "— highest volume concentration, real volume-at-price rather than a daily-bar approximation")
 
     # 52-week levels
     if len(df) >= 30:
@@ -777,32 +1498,37 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None):
 
     # ---------------- SECTION 4: Price Action Analysis ----------------
     lines.append("")
-    lines.append("--- PRICE ACTION (last 10 candles) ---")
+    lines.append("--- PRICE ACTION ---")
     recent10 = df.tail(10)
-
-    engulf = detect_engulfing(recent10)
-    if engulf:
-        lines.append(f"Candle pattern: {engulf}")
-
-    pin = detect_pin_bar(recent10)
-    if pin:
-        lines.append(f"Candle pattern: {pin}")
-
-    doji = detect_doji(recent10)
-    if doji:
-        lines.append(f"Candle pattern: {doji}")
 
     inside_count = detect_inside_bars(recent10)
     if inside_count > 0:
         lines.append(f"Inside bar(s): {inside_count} consecutive — compression signal")
 
-    if not engulf and not pin and not doji and inside_count == 0:
-        lines.append("Candle pattern: None detected")
-
     wick_result = wick_analysis(df, n=3)
     if wick_result:
-        wick_label, avg_up, avg_lo = wick_result
+        wick_label, _, _ = wick_result
         lines.append(f"Wick analysis: {wick_label}")
+
+    # ---------------- SECTION 4b: Chart Patterns ----------------
+    lines.append("")
+    lines.append("--- CHART PATTERNS ---")
+    pattern_matches = chart_patterns.detect_all(df)
+    if pattern_matches:
+        lines.append("(Quality is a geometric heuristic -- fit/pivots/volume -- not a "
+                      "calibrated probability. Measured against synthetic no-pattern data, "
+                      "it shows no relationship to actual outcomes. Treat as a filter for "
+                      "which patterns are worth a manual look, not a win-rate estimate.)")
+        for pm in pattern_matches:
+            age = pivot_age_sessions(df, pm.formed_date)
+            age_bit = f" ({age} session{'s' if age != 1 else ''} ago)" if age is not None else ""
+            lines.append(f"[{pm.bias}] {pm.name} ({pm.category}) — "
+                          f"Quality: {quality_text(pm.confidence)} — Formed: {pm.formed_date}{age_bit} — "
+                          f"Status: {pm.status}")
+            target_bit = f" | Target: {pm.price_target}" if pm.price_target != "N/A" else ""
+            lines.append(f"    {pm.detail}{target_bit}")
+    else:
+        lines.append("No chart patterns detected.")
 
     key_zones = {}
     if len(df) >= 200 and not np.isnan(sma200.iloc[-1]):
@@ -830,7 +1556,6 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None):
     lines.append("")
     lines.append("--- MOMENTUM & ENTRY TRIGGERS ---")
 
-    squeeze_fired = False
     momentum_positive = False
     momentum_rising = False
     squeeze_data = None
@@ -852,7 +1577,6 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None):
             lines.append(f"SQUEEZE: COMPRESSED ({current_consec} bars) — volatility coiling")
         elif fired_today:
             lines.append("SQUEEZE: FIRED today — breakout alert")
-            squeeze_fired = True
         else:
             bars_since_fire = 0
             for i in range(len(squeeze_on_series) - 1, 0, -1):
@@ -947,7 +1671,7 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None):
             elif rsi_val < 30:
                 flag = " — OVERSOLD"
             lines.append(f"RSI(14): {rsi_val:.1f}{flag}")
-            divergence = rsi_divergence(df, rsi_series, lookback=10)
+            divergence = rsi_divergence(df, rsi_series)
             if divergence:
                 for d in divergence:
                     lines.append(f"DIVERGENCE: {d}")
@@ -975,22 +1699,42 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None):
 
     iv_rank = None
     hv30_val = None
+    real_iv_context = None
     if len(df) >= 30:
         hv30_val = calc_hv(df["Close"], window=30)
         if hv30_val is not None:
             lines.append(f"HV30: {hv30_val * 100:.1f}%")
+
+            real_iv_context = fetch_real_iv_context(ticker, hv30_val)
+            if real_iv_context is not None:
+                iv = real_iv_context["iv"]
+                spread = real_iv_context["iv_minus_hv"]
+                spread_bit = f", IV-HV spread {spread * 100:+.1f} pts" if spread is not None else ""
+                stale_bit = (" [snapshot from a prior day]"
+                              if real_iv_context["snapshot_date"] != report_date else "")
+                lines.append(f"Real ATM IV ({real_iv_context['expiration']} exp, "
+                              f"{real_iv_context['dte']}d): {iv * 100:.1f}%{spread_bit}{stale_bit}")
+
             if len(df) >= 60:
                 iv_rank = calc_iv_rank(df["Close"], window=30, lookback=252)
                 if iv_rank is not None:
+                    # This is a REALIZED-volatility percentile, not a true options-market
+                    # IV rank (which needs actual implied vol data this tool doesn't have).
+                    # It can diverge sharply from real IV, especially around earnings
+                    # (IV rises pre-earnings while realized vol stays low -- this reads
+                    # "low" exactly when real premium is richest) or right after a shock
+                    # (realized vol stays elevated for weeks after IV has already
+                    # mean-reverted). Labeled honestly rather than as an options signal.
                     if iv_rank < 30:
-                        iv_label = "Low IV — avoid selling premium, wait for expansion"
+                        iv_label = "Low"
                     elif iv_rank < 50:
-                        iv_label = "Moderate IV — selective premium selling"
+                        iv_label = "Moderate"
                     elif iv_rank < 70:
-                        iv_label = "Elevated IV — iron condor and jade lizard conditions favorable"
+                        iv_label = "Elevated"
                     else:
-                        iv_label = "Very high IV — premium selling highly favorable, size conservatively"
-                    lines.append(f"IV Rank (HV-based): {iv_rank:.1f}% — {iv_label}")
+                        iv_label = "Very high"
+                    lines.append(f"HV percentile (realized vol, NOT implied — see Trade Idea "
+                                  f"caveat): {iv_rank:.1f}% ({iv_label})")
                 else:
                     lines.append("IV Rank: Insufficient data")
             else:
@@ -1001,13 +1745,15 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None):
         lines.append("HV30 / IV Rank: Insufficient data")
 
     # ---------------- SECTION 7: Plain English Summary ----------------
+    # This section doesn't just restate each indicator -- it weighs every
+    # directional signal (trend structure, MACD, ADX/DI, momentum, price vs
+    # 200 SMA, and now the detected chart patterns) into one net read, then
+    # explains the conclusion using only the signals that actually drove it.
     lines.append("")
     lines.append("--- PLAIN ENGLISH SUMMARY ---")
     mode_label = mode.capitalize()
     date_str = report_date.strftime("%Y-%m-%d")
     lines.append(f"{ticker} — {date_str} {mode_label} Report:")
-
-    trend_sent = f"Trend: {'The higher timeframe structure is ' + trend.lower() + ' (' + bias.lower() + ')' if has_min_data else 'Insufficient data to determine trend'}."
 
     nearest_support = None
     nearest_resistance = None
@@ -1018,185 +1764,376 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None):
     if candidates_above:
         nearest_resistance = min(candidates_above)
 
+    # Confluence numbers come from compute_confluence (see its docstring) --
+    # a self-contained function shared with the historical backtest, so
+    # both are guaranteed to run the exact same logic rather than the
+    # backtest hand-reimplementing it and risking silent drift.
+    confluence = compute_confluence(df, pattern_matches)
+    signals = confluence["signals"]
+    net = confluence["net"]
+    bull_weight = confluence["bull_weight"]
+    bear_weight = confluence["bear_weight"]
+    total_weight = confluence["total_weight"]
+    sufficient_evidence = confluence["sufficient_evidence"]
+
+    winning_dir = 1 if bull_weight >= bear_weight else -1
+    supporting = sorted([s for s in signals if s[1] == winning_dir], key=lambda s: -s[2])[:2]
+    opposing = sorted([s for s in signals if s[1] == -winning_dir], key=lambda s: -s[2])[:1]
+    support_phrase = "; ".join(note for _, _, _, note in supporting)
+    # The caution clause used to be suppressed above |net|=0.85 -- exactly
+    # backwards, since a maxed-out net is what happens when opposing
+    # evidence gets excluded rather than when it's genuinely absent. Any
+    # opposing signal that exists is now always surfaced.
+    oppose_bit = f" Caution: {opposing[0][3]}." if opposing else ""
+
+    if total_weight == 0:
+        net_label = "No clear directional edge"
+        bottom_line = "Bottom line: No clear directional edge — no usable signals for this ticker today."
+    elif not sufficient_evidence:
+        net_label = "Insufficient evidence"
+        bottom_line = (f"Bottom line: Insufficient evidence for a directional call — only "
+                        f"{support_phrase or 'thin signal coverage'} (total weight {total_weight:.1f}, "
+                        f"need {MIN_CONFLUENCE_WEIGHT:.1f}+ from both the trend/momentum and pattern "
+                        "families combined). Treat as no edge.")
+    elif abs(net) < 0.15:
+        net_label = "Conflicting signals"
+        bottom_line = f"Bottom line: Conflicting signals — {support_phrase}.{oppose_bit} Wait for clarity."
+    else:
+        strength = "confluence" if abs(net) >= 0.75 else "lean"
+        net_label = f"{'Bullish' if winning_dir > 0 else 'Bearish'} {strength}"
+        bottom_line = f"Bottom line: {net_label} — {support_phrase}.{oppose_bit}"
+    lines.append(bottom_line)
+
+    if has_min_data and trend == "RANGE":
+        lines.append("Structure: range-bound — no clean higher-timeframe trend to lean on, "
+                      "so treat the signals above as tactical, not structural.")
+
     levels_sent = "Key levels: "
     if nearest_support is not None and nearest_resistance is not None:
-        levels_sent += f"Nearest support sits near {fmt_price(nearest_support)} with resistance near {fmt_price(nearest_resistance)}."
+        levels_sent += f"support near {fmt_price(nearest_support)}, resistance near {fmt_price(nearest_resistance)}."
     elif nearest_support is not None:
-        levels_sent += f"Nearest support sits near {fmt_price(nearest_support)}, no clear resistance level identified."
+        levels_sent += f"support near {fmt_price(nearest_support)}; no clear resistance identified."
     elif nearest_resistance is not None:
-        levels_sent += f"Nearest resistance sits near {fmt_price(nearest_resistance)}, no clear support level identified."
+        levels_sent += f"resistance near {fmt_price(nearest_resistance)}; no clear support identified."
     else:
-        levels_sent += "Insufficient data to identify key levels."
+        levels_sent += "insufficient data to identify key levels."
+    lines.append(levels_sent)
 
-    mom_bits = []
-    if squeeze_data is not None:
-        if current_squeeze_on:
-            mom_bits.append("squeeze is compressed")
-        elif fired_today:
-            mom_bits.append("squeeze just fired")
-        else:
-            mom_bits.append("squeeze is off")
-    if len(df) >= 35:
-        mom_bits.append(f"MACD is {macd_status.lower()}")
-    if adx_val is not None:
-        mom_bits.append(f"ADX at {adx_val:.0f} ({'trending' if adx_val > 25 else 'ranging'})")
-    momentum_sent = "Momentum: " + (", ".join(mom_bits) + "." if mom_bits else "Insufficient data.")
+    # Invalidated patterns are excluded here -- they're already counted as
+    # contrarian evidence in the confluence above; presenting one as a live
+    # setup with a forward-looking target would contradict that reasoning.
+    live_pattern = next((pm for pm in pattern_matches if pm.status != "Invalidated"), None)
+    if live_pattern:
+        pattern_bit = (f"Pattern in play: {live_pattern.name} "
+                        f"({live_pattern.status.lower()}, {quality_text(live_pattern.confidence)} quality)")
+        if live_pattern.price_target != "N/A":
+            pattern_bit += f", projecting toward {live_pattern.price_target} if it plays out"
+        lines.append(pattern_bit + ".")
+
+    if divergence:
+        direction_word = "bullish" if any("Bullish" in d for d in divergence) else "bearish"
+        lines.append(f"Caution: {direction_word} RSI divergence — momentum is quietly disagreeing with price.")
 
     vol_bits = []
     if iv_rank is not None:
         vol_bits.append(f"IV rank is {iv_rank:.0f}%")
     if atr_val is not None:
         vol_bits.append(f"ATR is {fmt_price(atr_val)}")
-    vol_sent = "Volatility: " + (", ".join(vol_bits) + "." if vol_bits else "Insufficient data.")
+    if vol_bits:
+        lines.append("Volatility: " + ", ".join(vol_bits) + ".")
 
     watch_sent = "Watch for: "
-    if nearest_resistance is not None and nearest_support is not None:
+    if live_pattern and live_pattern.status == "Forming" and live_pattern.category != "Candlestick":
+        watch_sent += f"confirmation of the {live_pattern.name} — a decisive close beyond its boundary."
+    elif live_pattern and live_pattern.status == "Forming":
+        watch_sent += f"follow-through on the {live_pattern.name} over the next session or two."
+    elif nearest_resistance is not None and nearest_support is not None:
         watch_sent += (f"a close above {fmt_price(nearest_resistance)} to confirm strength, "
                         f"or a break below {fmt_price(nearest_support)} to signal weakness.")
     else:
         watch_sent += "confirmation of the current structure via a decisive close through the nearest key level."
-
-    lines.append(trend_sent)
-    lines.append(levels_sent)
-    lines.append(momentum_sent)
-    lines.append(vol_sent)
     lines.append(watch_sent)
 
     # ---------------- SECTION 8: Trade Idea ----------------
+    # This reports a DIRECTIONAL STANCE + VOLATILITY READ, and -- only when
+    # a local same-day/recent option-chain snapshot exists for this ticker
+    # (option_chain.py) -- a named structure with real strikes/credit/width
+    # pulled from that chain and its own defining constraint actually
+    # checked (e.g. a "Jade Lizard" is only named as such once the credit
+    # collected is verified to exceed the call-spread width; otherwise it's
+    # reported as the honest Bull Put Spread it actually is). Without a
+    # chain for this ticker, structure selection is left to you.
     lines.append("")
     lines.append("--- TRADE IDEA ---")
-
-    trend_bullish = trend == "UPTREND"
-    trend_bearish = trend == "DOWNTREND"
-
-    # Derive momentum state directly from the momentum series here so the
-    # trade logic never confuses "insufficient data" (default False upstream)
-    # with a genuine negative/falling reading.
-    mom_current = None
-    mom_prev = None
-    if squeeze_data is not None:
-        momentum_series_s8 = squeeze_data["momentum"]
-        if not momentum_series_s8.dropna().empty:
-            mc = momentum_series_s8.iloc[-1]
-            mp = momentum_series_s8.iloc[-2] if len(momentum_series_s8) >= 2 else np.nan
-            if not np.isnan(mc):
-                mom_current = float(mc)
-            if not np.isnan(mp):
-                mom_prev = float(mp)
-
-    momentum_negative_s8 = mom_current is not None and mom_current < 0
-    momentum_positive_s8 = mom_current is not None and mom_current > 0
-    momentum_falling_s8 = mom_current is not None and mom_prev is not None and mom_current < mom_prev
-    momentum_rising_s8 = mom_current is not None and mom_prev is not None and mom_current > mom_prev
-
-    # "Not strongly directional" = absolute momentum value sits in the lowest
-    # 30% of its own 20-period range.
-    momentum_low_directional = False
-    if squeeze_data is not None and mom_current is not None:
-        last20_mom = squeeze_data["momentum"].tail(20).dropna()
-        if len(last20_mom) >= 10:
-            pct = scipy_stats.percentileofscore(last20_mom.abs().values, abs(mom_current))
-            momentum_low_directional = pct <= 30
-
-    # Squeeze fired within the last 3 bars, not just the most recent bar.
-    squeeze_fired_last3 = False
-    if squeeze_data is not None:
-        squeeze_on_series_s8 = squeeze_data["squeeze_on"]
-        consec_series_s8 = squeeze_data["consec"]
-        n_bars = len(squeeze_on_series_s8)
-        for i in range(max(1, n_bars - 3), n_bars):
-            cur_on = squeeze_on_series_s8.iloc[i]
-            prev_on = squeeze_on_series_s8.iloc[i - 1]
-            prev_cnt = consec_series_s8.iloc[i - 1]
-            if pd.isna(cur_on) or pd.isna(prev_on):
-                continue
-            if (not bool(cur_on)) and bool(prev_on) and prev_cnt >= 6:
-                squeeze_fired_last3 = True
-                break
-
-    price_above_200sma = len(df) >= 200 and not np.isnan(sma200.iloc[-1]) and current_price > sma200.iloc[-1]
-    bullish_engulfing_last = engulf == "Bullish engulfing"
-
-    trade_idea = None
-    entry_zone = None
-    stop_level = None
-    target_level = None
-
-    # Condition 1 — Bearish breakdown
-    if trend_bearish and momentum_negative_s8 and momentum_falling_s8 and adx_val is not None and adx_val > 25:
-        resistance_ref = pd_high if pd_high is not None else nearest_resistance
-        trade_idea = ("BEARISH CALL SPREAD candidate — confirmed downtrend with strong momentum. "
-                       f"Consider selling call spread above resistance at {fmt_price(resistance_ref)}.")
-        if resistance_ref is not None:
-            entry_zone = f"Short near {fmt_price(resistance_ref)} (prior day high)"
-            if atr_val is not None:
-                stop_level = f"{fmt_price(resistance_ref + atr_val)} (1 ATR above entry)"
-            target_level = fmt_price(nearest_support) if nearest_support is not None else "Next support level (insufficient data)"
-
-    # Condition 2 — Bullish breakout
-    elif squeeze_fired_last3 and momentum_positive_s8 and trend_bullish:
-        trade_idea = ("BULLISH PUT SPREAD or SWING LONG candidate — squeeze breakout with bullish momentum. "
-                       f"Consider entry above {fmt_price(pd_high)} with stop at 1 ATR below entry.")
-        if pd_high is not None:
-            entry_zone = f"Above {fmt_price(pd_high)} (prior day high breakout)"
-            if atr_val is not None:
-                stop_level = f"{fmt_price(pd_high - atr_val)} (1 ATR below entry)"
-            target_level = fmt_price(nearest_resistance) if nearest_resistance is not None else "Next resistance level (insufficient data)"
-
-    # Condition 3 — Jade lizard / bullish put spread
-    elif bullish_engulfing_last and momentum_rising_s8 and iv_rank is not None and iv_rank > 50 and price_above_200sma:
-        trade_idea = ("JADE LIZARD candidate — bullish engulfing at support with elevated IV and bullish structure. "
-                       f"Consider jade lizard with short put below {fmt_price(pd_low)}.")
-        if pd_low is not None:
-            entry_zone = f"Short put below {fmt_price(pd_low)} (prior day low)"
-            if atr_val is not None:
-                stop_level = f"{fmt_price(pd_low - atr_val)} (1 ATR below entry)"
-            target_level = fmt_price(nearest_resistance) if nearest_resistance is not None else "Next resistance level (insufficient data)"
-
-    # Condition 4 — Iron condor
-    elif iv_rank is not None and iv_rank > 50 and adx_val is not None and adx_val < 25:
-        expected_move_s8 = None
-        if hv30_val is not None:
-            days_to_friday_s8 = days_until_next_friday(report_date)
-            expected_move_s8 = current_price * (hv30_val / np.sqrt(252)) * np.sqrt(days_to_friday_s8)
-        if expected_move_s8 is not None:
-            put_strike = current_price - expected_move_s8
-            call_strike = current_price + expected_move_s8
-            trade_idea = (f"IRON CONDOR candidate — IV rank {iv_rank:.0f}% with ranging ADX {adx_val:.0f}. "
-                           f"Price expected to stay within {fmt_price(put_strike)} to {fmt_price(call_strike)} "
-                           "this week. Short strikes beyond this range.")
-            entry_zone = f"Sell condor at current price {fmt_price(current_price)}"
-            if atr_val is not None:
-                stop_level = f"Adjust if price closes beyond {fmt_price(current_price - atr_val)} / {fmt_price(current_price + atr_val)} (1 ATR)"
-            target_level = f"Max profit if price stays between {fmt_price(put_strike)} and {fmt_price(call_strike)} through expiration"
-        else:
-            trade_idea = (f"IRON CONDOR candidate — IV rank {iv_rank:.0f}% with ranging ADX {adx_val:.0f}. "
-                           "Insufficient data to calculate expected move for strike selection.")
-
-    # Condition 5 — Caution (RSI divergence)
-    elif divergence:
-        direction = "bullish" if any("Bullish" in d for d in divergence) else "bearish"
-        trade_idea = (f"CAUTION — {direction} divergence detected. "
-                       "Wait for confirmation before entering any position.")
-
-    # Condition 6 — Low IV
-    elif iv_rank is not None and iv_rank < 30:
-        trade_idea = ("NO TRADE — IV too low for premium selling. "
-                       "Wait for volatility expansion.")
-
-    # Condition 7 — Default
+    if real_iv_context is not None:
+        lines.append("(Directional bias + volatility read below; any structure/strikes shown "
+                      f"are verified against the {real_iv_context['snapshot_date']} option chain, "
+                      "not fabricated.)")
     else:
-        trade_idea = "WAIT — no high-confidence setup present today."
+        lines.append("(Directional bias + volatility read only. No options-chain data -- "
+                      "structure selection and strike/credit verification are yours.)")
 
-    lines.append(f"TRADE IDEA: {trade_idea}")
-    if entry_zone is not None:
-        lines.append(f"Entry zone: {entry_zone}")
-    if stop_level is not None:
-        lines.append(f"Stop (1 ATR): {stop_level}")
-    if target_level is not None:
-        lines.append(f"Target: {target_level}")
+    trending_market = adx_val is not None and adx_val > 25
 
-    return "\n".join(lines)
+    # Prefer a REAL variance-risk-premium read (real ATM IV vs. realized
+    # HV30, from a locally downloaded chain -- see fetch_real_iv_context)
+    # over the HV-percentile proxy below whenever a chain is available:
+    # realized-vol-only readings can only describe what already happened,
+    # not what the market is pricing, and have already been caught
+    # disagreeing with a real chain (SPCX showed HV-percentile "Elevated"
+    # while real IV was routinely rich a different amount than that implied).
+    if real_iv_context is not None and real_iv_context["iv_minus_hv"] is not None:
+        iv_spread = real_iv_context["iv_minus_hv"]
+        # 5 vol points of real IV over realized vol = a real premium --
+        # roughly matches the old HV30>50% fallback's selectivity without
+        # being tied to an arbitrary absolute HV level.
+        iv_high = iv_spread > 0.05
+        iv_low = iv_spread < -0.05
+        iv_rich_fallback = False
+    else:
+        iv_high = iv_rank is not None and iv_rank > 50
+        iv_low = iv_rank is not None and iv_rank < 30
+        # IV rank needs 60+ days of history to compute (see calc_iv_rank); a
+        # young ticker with none available previously fell through to "IV too
+        # low" by default, which is backwards -- unknown premium richness is not
+        # the same as cheap premium. Fall back to raw HV30 as a rough read
+        # instead of silently assuming "low" when we simply don't know. Note
+        # this fallback is itself weak: high realized vol means the stock moves
+        # a lot, which is a reason options SHOULD be expensive, not proof they
+        # are overpriced relative to what's coming (the actual edge in selling
+        # premium is IV exceeding subsequent realized vol -- a relationship this
+        # tool cannot measure with realized vol alone).
+        iv_rich_fallback = iv_rank is None and hv30_val is not None and hv30_val > 0.50
+    sell_premium_ok = iv_high or iv_rich_fallback
+
+    # A directional call additionally requires the same minimum-evidence
+    # floor as the confluence verdict above -- net can cross +/-0.15 on a
+    # single thin signal, and Trade Idea must not act more confident than
+    # the Bottom Line it's built from.
+    bullish_edge = sufficient_evidence and net >= 0.15
+    bearish_edge = sufficient_evidence and net <= -0.15
+
+    bullish_pattern = next((pm for pm in pattern_matches
+                             if pm.bias == "Bullish" and pm.status != "Invalidated"), None)
+    bearish_pattern = next((pm for pm in pattern_matches
+                             if pm.bias == "Bearish" and pm.status != "Invalidated"), None)
+
+    lines.append(f"Directional bias: {net_label} (net {net:+.2f})")
+
+    if real_iv_context is not None and real_iv_context["iv_minus_hv"] is not None:
+        iv_pct = real_iv_context["iv"] * 100
+        spread_pct = real_iv_context["iv_minus_hv"] * 100
+        exp_bit = f"{real_iv_context['expiration']} exp"
+        if iv_high:
+            vol_text = (f"Real ATM IV {iv_pct:.0f}% ({exp_bit}) is {spread_pct:+.1f} pts over HV30 "
+                        "— premium genuinely rich, verified against today's chain")
+        elif iv_low:
+            vol_text = (f"Real ATM IV {iv_pct:.0f}% ({exp_bit}) is {spread_pct:.1f} pts under HV30 "
+                        "— premium not rich; selling here has little edge")
+        else:
+            vol_text = (f"Real ATM IV {iv_pct:.0f}% ({exp_bit}) roughly matches HV30 ({spread_pct:+.1f} pts) "
+                        "— no clear edge buying or selling premium")
+    elif iv_high:
+        vol_text = f"Elevated IV rank ({iv_rank:.0f}%) — premium may be rich; verify against a real chain"
+    elif iv_rich_fallback:
+        vol_text = (f"High realized volatility (HV30 {hv30_val * 100:.0f}%), IV rank unavailable "
+                     "(insufficient history) — premium richness unconfirmed, not a sell signal by itself")
+    elif iv_low:
+        vol_text = f"Low IV rank ({iv_rank:.0f}%) — premium likely cheap to sell, directional exposure favored"
+    elif iv_rank is not None:
+        vol_text = f"Moderate IV rank ({iv_rank:.0f}%) — no strong edge buying or selling premium"
+    else:
+        vol_text = "IV rank unavailable and volatility not clearly elevated"
+    lines.append(f"Volatility read: {vol_text}")
+
+    trend_text = (f"Trending (ADX {adx_val:.0f})" if trending_market
+                  else f"Ranging (ADX {adx_val:.0f})" if adx_val is not None
+                  else "Insufficient data")
+    lines.append(f"Trend regime: {trend_text}")
+
+    earnings_date = fetch_next_earnings_date(ticker)
+    days_to_earnings = (earnings_date - report_date).days if earnings_date is not None else None
+    if days_to_earnings is not None and 0 <= days_to_earnings <= 7:
+        lines.append(f"EARNINGS WARNING: {ticker} reports on {earnings_date} "
+                      f"({days_to_earnings} day{'s' if days_to_earnings != 1 else ''} away). "
+                      "The volatility read above is unreliable heading into a binary event -- "
+                      "IV typically rises ahead of earnings while realized vol (what this tool "
+                      "measures) does not. Do not treat this as a premium-selling signal until "
+                      "after the event.")
+    elif earnings_date is not None:
+        lines.append(f"Next earnings: {earnings_date}.")
+
+    dividend_date = fetch_next_dividend_date(ticker)
+    days_to_dividend = (dividend_date - report_date).days if dividend_date is not None else None
+    if days_to_dividend is not None and 0 <= days_to_dividend <= 7:
+        lines.append(f"DIVIDEND WARNING: {ticker} goes ex-dividend on {dividend_date} "
+                      f"({days_to_dividend} day{'s' if days_to_dividend != 1 else ''} away) -- a short "
+                      "call carries early-assignment risk into this date if its extrinsic value drops "
+                      "below the dividend. Check assignment risk before holding a short call through it.")
+
+    ref_level = None
+    ref_target_raw = None
+    ref_label = None
+    has_directional_setup = sufficient_evidence and (bullish_edge or bearish_edge)
+    if has_directional_setup:
+        if bullish_edge:
+            ref_pattern = bullish_pattern
+            ref_level = pd_low if pd_low is not None else nearest_support
+            ref_label = "support"
+            ref_target_raw = (parse_price(ref_pattern.price_target) if ref_pattern and ref_pattern.price_target != "N/A"
+                               else nearest_resistance)
+        else:
+            ref_pattern = bearish_pattern
+            ref_level = pd_high if pd_high is not None else nearest_resistance
+            ref_label = "resistance"
+            ref_target_raw = (parse_price(ref_pattern.price_target) if ref_pattern and ref_pattern.price_target != "N/A"
+                               else nearest_support)
+
+    # Risk/reward: reward = distance from spot to the reference target,
+    # risk = the 1-ATR stop distance already shown above it. The tool
+    # previously never computed this at all -- a setup with a $7.77 stop
+    # and a $3.23 target printed identically to one with the reverse. A
+    # ratio below MIN_RR is still shown (hiding the numbers outright would
+    # remove information a trader might still want), but is explicitly
+    # flagged rather than presented as an equally actionable idea.
+    MIN_RR = 1.5
+    rr = None
+    if ref_target_raw is not None and atr_val is not None and atr_val > 0:
+        rr = abs(ref_target_raw - current_price) / atr_val
+
+    if has_directional_setup and ref_level is not None:
+        lines.append(f"Reference level: {ref_label} near {fmt_price(ref_level)}")
+    if has_directional_setup and atr_val is not None:
+        lines.append(f"Reference stop distance: {fmt_price(atr_val)} (1 ATR — a distance, not a "
+                      "risk-management rule; size and manage per the actual structure chosen)")
+
+    if has_directional_setup and rr is not None:
+        weak_bit = f" (below the {MIN_RR:.1f}:1 this tool treats as worth calling a real setup)" if rr < MIN_RR else ""
+        lines.append(f"Reference target: {fmt_price(ref_target_raw)} — risk/reward {rr:.1f}:1{weak_bit} "
+                      "(directional reference only -- meaningless for a credit structure, whose max "
+                      "profit is the credit received)")
+        if rr < MIN_RR:
+            lines.append(f"CAUTION: weak risk/reward — a directional edge exists ({net_label.lower()}) "
+                          "but the reference target doesn't clear this tool's risk/reward bar against a "
+                          "1-ATR stop. Treat this as a weak setup even though a directional edge exists.")
+        else:
+            risk_dollars = ACCOUNT_SIZE * RISK_PCT_PER_TRADE
+            shares = int(risk_dollars // atr_val)
+            lines.append(f"Position size (equity/stock only): ~{shares} shares — risking "
+                          f"{fmt_price(risk_dollars)} ({RISK_PCT_PER_TRADE * 100:.1f}% of a "
+                          f"{fmt_price(ACCOUNT_SIZE)} account) at the {fmt_price(atr_val)} stop distance. "
+                          "For an options structure, size by the structure's own max loss instead of "
+                          "share count -- this number assumes a straight equity position.")
+    elif has_directional_setup:
+        lines.append("Reference target: unavailable — risk/reward cannot be assessed.")
+    elif not trending_market and sell_premium_ok:
+        lines.append("Setup shape: ranging tape with volatility read favoring premium sale over "
+                      "direction -- a non-directional structure (verified against a real chain) "
+                      "may fit better than a directional one here.")
+    else:
+        lines.append("No actionable setup: insufficient directional evidence and no clear "
+                      "volatility edge either way.")
+
+    # ---- Real-chain structure verification -- only runs when a local
+    # option-chain snapshot exists for this ticker; every strike/credit/
+    # width number below is read from that chain, never guessed or
+    # theoretical. ----
+    if real_iv_context is not None and sell_premium_ok:
+        chain, expiration = real_iv_context["chain"], real_iv_context["expiration"]
+        if bullish_edge:
+            spread = build_credit_spread(chain, expiration, "put", target_short_delta=0.25)
+            if spread is not None:
+                rr_credit = spread["credit"] / spread["max_loss"]
+                delta_bit = f" (short delta {spread['short_delta']:.2f})" if spread["short_delta"] is not None else ""
+                lines.append(f"Bull Put Spread ({expiration} exp, verified against today's chain): "
+                              f"sell {fmt_price(spread['short_strike'])}P / buy {fmt_price(spread['long_strike'])}P "
+                              f"— credit {fmt_price(spread['credit'])}, width {fmt_price(spread['width'])}, "
+                              f"max loss {fmt_price(spread['max_loss'])}, R:R {rr_credit:.2f}:1{delta_bit}")
+                jade = check_jade_lizard(chain, expiration, spread)
+                if jade is not None:
+                    if jade["verified"]:
+                        lines.append(f"  -> Verified as a Jade Lizard: naked {fmt_price(spread['short_strike'])}P "
+                                      f"+ sell {fmt_price(jade['call_short_strike'])}C / buy "
+                                      f"{fmt_price(jade['call_long_strike'])}C — total credit "
+                                      f"{fmt_price(jade['total_credit'])} >= call spread width "
+                                      f"{fmt_price(jade['call_width'])}, so upside risk is fully covered by credit.")
+                    else:
+                        lines.append(f"  (Adding a {fmt_price(jade['call_short_strike'])}C/"
+                                      f"{fmt_price(jade['call_long_strike'])}C call spread would NOT make this a "
+                                      f"true Jade Lizard: total credit {fmt_price(jade['total_credit'])} falls "
+                                      f"short of the {fmt_price(jade['call_width'])} width needed to cover upside "
+                                      "risk — stick with the put spread alone.)")
+            else:
+                lines.append("Bull Put Spread: today's chain doesn't have enough delta/bid-ask data "
+                              "to select strikes automatically — verify manually.")
+        elif bearish_edge:
+            spread = build_credit_spread(chain, expiration, "call", target_short_delta=0.25)
+            if spread is not None:
+                rr_credit = spread["credit"] / spread["max_loss"]
+                delta_bit = f" (short delta {spread['short_delta']:.2f})" if spread["short_delta"] is not None else ""
+                lines.append(f"Bear Call Spread ({expiration} exp, verified against today's chain): "
+                              f"sell {fmt_price(spread['short_strike'])}C / buy {fmt_price(spread['long_strike'])}C "
+                              f"— credit {fmt_price(spread['credit'])}, width {fmt_price(spread['width'])}, "
+                              f"max loss {fmt_price(spread['max_loss'])}, R:R {rr_credit:.2f}:1{delta_bit}")
+            else:
+                lines.append("Bear Call Spread: today's chain doesn't have enough delta/bid-ask data "
+                              "to select strikes automatically — verify manually.")
+        elif not trending_market:
+            put_spread = build_credit_spread(chain, expiration, "put", target_short_delta=0.16)
+            call_spread = build_credit_spread(chain, expiration, "call", target_short_delta=0.16)
+            if put_spread is not None and call_spread is not None:
+                total_credit = put_spread["credit"] + call_spread["credit"]
+                max_loss = max(put_spread["width"], call_spread["width"]) - total_credit
+                rr_bit = f", R:R {total_credit / max_loss:.2f}:1" if max_loss > 0 else ""
+                lines.append(f"Iron Condor ({expiration} exp, verified against today's chain): "
+                              f"sell {fmt_price(put_spread['short_strike'])}P/buy {fmt_price(put_spread['long_strike'])}P "
+                              f"+ sell {fmt_price(call_spread['short_strike'])}C/buy {fmt_price(call_spread['long_strike'])}C "
+                              f"— total credit {fmt_price(total_credit)}, max loss {fmt_price(max_loss)}{rr_bit}")
+            else:
+                lines.append("Iron Condor: today's chain doesn't have enough delta/bid-ask data "
+                              "to select strikes automatically — verify manually.")
+
+    if divergence:
+        direction_word = "bullish" if any("Bullish" in d for d in divergence) else "bearish"
+        lines.append(f"Caution: {direction_word} RSI divergence detected — consider reduced size "
+                      "or waiting for it to resolve before entering.")
+
+    prediction_log.log_run(
+        ticker=ticker, report_date=report_date, mode=mode, spot=current_price,
+        pattern_matches=pattern_matches,
+        confluence={
+            "net": net, "net_label": net_label, "bull_weight": bull_weight,
+            "bear_weight": bear_weight, "total_weight": total_weight,
+            "sufficient_evidence": sufficient_evidence,
+            "signals": [[label, direction, weight, note] for label, direction, weight, note in signals],
+        },
+        trade_idea={
+            "directional_bias": net_label, "net": net, "iv_rank": iv_rank, "hv30": hv30_val,
+            "adx": adx_val, "trending": trending_market, "earnings_date": earnings_date,
+            "days_to_earnings": days_to_earnings, "reference_level": ref_level,
+            "reference_stop_distance": atr_val, "reference_target": fmt_price(ref_target_raw) if ref_target_raw is not None else None,
+        },
+    )
+
+    if iv_high or iv_rich_fallback:
+        vol_stance = "sell premium"
+    elif iv_low:
+        vol_stance = "buy premium"
+    else:
+        vol_stance = "neutral/unknown"
+
+    direction = 1 if net_label.startswith("Bullish") else -1 if net_label.startswith("Bearish") else 0
+    portfolio_info = {
+        "ticker": ticker,
+        "net_label": net_label,
+        "direction": direction,
+        "sufficient_evidence": sufficient_evidence,
+        "vol_stance": vol_stance,
+        "earnings_soon": days_to_earnings is not None and 0 <= days_to_earnings <= 7,
+        "spy_correlation": beta_ctx["correlation"] if beta_ctx is not None else None,
+    }
+
+    return "\n".join(lines), portfolio_info
 
 
 # ---------------------------------------------------------------------------
@@ -1204,11 +2141,13 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None):
 # ---------------------------------------------------------------------------
 
 def main():
-    mode, now_et = get_run_mode()
-    report_date = now_et.date() if hasattr(now_et, "date") else date.today()
+    mode, now_et, is_trading_day = get_run_mode()
     mode_label = mode.capitalize()
 
     safe_print(f"Fetching data — run mode: {mode}")
+    if not is_trading_day:
+        safe_print(f"NOTE: {now_et.date()} is not a trading day (weekend/holiday) — "
+                    "the report will reflect the last available session.")
 
     data = {}
     for ticker in ALL_TICKERS:
@@ -1217,7 +2156,15 @@ def main():
             safe_print(f"WARNING: No data available for {ticker} — it will be skipped in the report.")
         data[ticker] = df
 
-    vix_value = fetch_vix()
+    # Stamp the report with the date of the most recent actual bar, not
+    # blindly with "today" -- these differ on weekends/holidays, or if a
+    # session's data hasn't posted yet, and a header claiming a date with no
+    # underlying bar is worse than an honest "as of" the last real one.
+    last_bar_dates = [df.index[-1].date() for df in data.values() if df is not None and not df.empty]
+    report_date = max(last_bar_dates) if last_bar_dates else (
+        now_et.date() if hasattr(now_et, "date") else date.today())
+
+    vix_value, vix_timestamp, vix_is_stale = fetch_vix()
 
     spy_line = analyze_market_ticker("SPY", data.get("SPY"))
     qqq_line = analyze_market_ticker("QQQ", data.get("QQQ"))
@@ -1228,19 +2175,30 @@ def main():
     report_lines.append(f"{report_date.strftime('%Y-%m-%d')} — {mode_label} Session")
     report_lines.append("")
     report_lines.append("MARKET CONTEXT")
-    for line in build_market_context_section(vix_value, spy_line, qqq_line):
+    for line in build_market_context_section(vix_value, vix_timestamp, vix_is_stale, spy_line, qqq_line,
+                                              report_date=report_date):
         report_lines.append(line)
     report_lines.append("=" * 40)
     report_lines.append("")
 
+    portfolio_infos = []
     for ticker in WATCHLIST:
         df = data.get(ticker)
         premarket_data = None
         if mode == "morning" and df is not None:
             premarket_data = fetch_premarket(ticker)
-        section = analyze_ticker(ticker, df, mode, report_date, premarket_data)
+        section, portfolio_info = analyze_ticker(ticker, df, mode, report_date, premarket_data,
+                                                  spy_df=data.get("SPY"))
         report_lines.append(section)
         report_lines.append("")
+        portfolio_infos.append(portfolio_info)
+
+    report_lines.append("=" * 40)
+    report_lines.append("PORTFOLIO VIEW")
+    for line in build_portfolio_section(portfolio_infos):
+        report_lines.append(line)
+    report_lines.append("=" * 40)
+    report_lines.append("")
 
     full_report = "\n".join(report_lines)
 

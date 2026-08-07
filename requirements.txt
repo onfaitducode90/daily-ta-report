@@ -1,0 +1,10 @@
+# Pinned exactly, not as a range: yfinance changed its auto_adjust default
+# in 0.2.51, which would silently change every OHLCV number this tool
+# reports with no error and no warning. fetch_history() sets auto_adjust
+# explicitly either way, but pin everything here so an environment rebuild
+# reproduces the same numbers rather than picking up whatever is newest.
+yfinance==1.4.1
+pandas==3.0.3
+numpy==2.4.6
+scipy==1.18.0
+scikit-learn==1.9.0
