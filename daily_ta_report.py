@@ -3006,9 +3006,11 @@ def main():
 
     # Best-effort Drive sync. This must never affect the exit status or
     # hold up report generation -- the file above is already saved and
-    # is the durable copy regardless of whether this step succeeds. A
-    # separate Task Scheduler job (`report_sync.py --flush`) also retries
-    # anything that fails here, independent of when the next report runs.
+    # is the durable copy regardless of whether this step succeeds. Report
+    # generation now runs on GitHub Actions, not a local machine, so a
+    # failed upload here isn't retried same-day by a local job -- it's
+    # retried on the next scheduled report run (report_sync.db round-trips
+    # through Drive via state_sync.py, so the PENDING/FAILED row survives).
     if report_sync is not None:
         try:
             overall_source = "cached" if any_cached else "live"

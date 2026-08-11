@@ -13,9 +13,14 @@ never fail because Drive is unreachable or misconfigured.
 
 Two independent triggers call flush_queue():
   1. daily_ta_report.py, once, right after it saves a new report.
-  2. A separate Task Scheduler job running `python report_sync.py --flush`
-     on a timer, so a report generated while offline doesn't sit PENDING
-     until the next scheduled report run hours later.
+  2. Any standalone `python report_sync.py --flush` invocation.
+Report generation now runs on GitHub Actions rather than a long-lived
+local machine, so trigger 1 is effectively the only one in practice --
+there's no local Task Scheduler job running --flush on a timer anymore.
+A report that fails to upload sits PENDING/FAILED until the next
+scheduled report run retries it (report_sync.db round-trips through
+Drive via state_sync.py, so the row survives between runs), rather than
+being retried same-day by a separate local process.
 Because of that, flush_queue() claims a row (UPDATE ... WHERE status IN
 (...)) immediately before uploading it rather than batching the read and
 the status change, so two near-simultaneous flushes can't both attempt
