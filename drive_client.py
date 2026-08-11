@@ -149,10 +149,10 @@ def find_or_create_folder(session, name, parent_id):
 
 def list_files(session, folder_id):
     """Non-trashed files directly inside folder_id, as a list of
-    {"id", "name"} dicts."""
+    {"id", "name", "modifiedTime"} dicts."""
     query = f"'{_escape(folder_id)}' in parents and trashed = false"
     try:
-        resp = session.get(_FILES_URL, params={"q": query, "fields": "files(id,name)"},
+        resp = session.get(_FILES_URL, params={"q": query, "fields": "files(id,name,modifiedTime)"},
                             timeout=REQUEST_TIMEOUT_SECONDS)
         resp.raise_for_status()
     except requests.exceptions.RequestException as e:
@@ -168,6 +168,14 @@ def download_file(session, file_id):
         return resp.content
     except requests.exceptions.RequestException as e:
         raise DriveError(f"Drive download failed for file {file_id}: {e}") from e
+
+
+def delete_file(session, file_id):
+    try:
+        resp = session.delete(f"{_FILES_URL}/{file_id}", timeout=REQUEST_TIMEOUT_SECONDS)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise DriveError(f"Drive delete failed for file {file_id}: {e}") from e
 
 
 def upload_or_update(session, filename, content_bytes, mime_type="text/plain", folder_id=None):

@@ -49,6 +49,7 @@ DB_PATH = os.path.join(LOG_DIR, "report_sync.db")
 
 MAX_RETRIES = 5
 STALE_UPLOADING_MINUTES = 10
+REPORT_RETENTION_COUNT = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS report_queue (
@@ -115,6 +116,24 @@ def _reclaim_stale_uploads(conn):
     """, (_now_iso(), cutoff))
 
 
+def _enforce_report_retention(session, keep=REPORT_RETENTION_COUNT):
+    """Deletes all but the `keep` most-recently-modified reports from the
+    Drive reports folder. Filters to daily_ta_report_*.txt explicitly --
+    that folder also holds the _state subfolder (see state_sync.py), and
+    this must never touch anything but the report files themselves. Never
+    raises: a cleanup failure just means old reports linger an extra
+    flush, not something worth failing the sync over."""
+    try:
+        files = drive_client.list_files(session, drive_client.DRIVE_FOLDER_ID)
+        reports = [f for f in files if f["name"].startswith("daily_ta_report_") and f["name"].endswith(".txt")]
+        reports.sort(key=lambda f: f["modifiedTime"], reverse=True)
+        for f in reports[keep:]:
+            drive_client.delete_file(session, f["id"])
+            print(f"Retention: deleted old report {f['name']}")
+    except Exception as e:
+        print(f"WARNING: Report retention cleanup failed ({e}) -- old reports may linger until next flush.")
+
+
 def flush_queue(max_retries=MAX_RETRIES):
     """Attempts to upload every outstanding (PENDING or previously-FAILED,
     under the retry cap) report. Returns a dict of counts for the caller
@@ -173,6 +192,9 @@ def flush_queue(max_retries=MAX_RETRIES):
                     """, (str(e)[:500], _now_iso(), row_id))
                     result["failed"] += 1
                 conn.commit()
+
+            if result["uploaded"] > 0:
+                _enforce_report_retention(session)
     except Exception as e:
         print(f"WARNING: Report sync flush failed unexpectedly: {e}")
     return result
