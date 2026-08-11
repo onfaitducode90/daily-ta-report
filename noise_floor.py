@@ -34,7 +34,7 @@ import daily_ta_report as R
 import chart_patterns as CP
 import option_chain as OC
 
-TICKERS = ["NVDA", "INTC", "SPY", "QQQ"]
+TICKERS = ["NVDA", "INTC", "SPY", "QQQ", "GLD", "SLV"]
 N_SHUFFLES = 50
 WINDOW = 300  # matches daily_ta_report.HISTORY_DAYS
 

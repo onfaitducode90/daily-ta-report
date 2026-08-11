@@ -34,7 +34,7 @@ import yfinance as yf
 import daily_ta_report as R
 import chart_patterns as CP
 
-BACKTEST_TICKERS = ["NVDA", "INTC", "SPY", "QQQ"]
+BACKTEST_TICKERS = ["NVDA", "INTC", "SPY", "QQQ", "GLD", "SLV"]
 HORIZONS = (1, 5, 10, 20)
 EVAL_STEP = 5       # evaluate every 5 trading bars (~weekly)
 WARMUP_BARS = 250   # need 200+ bars for the 200-day SMA, plus buffer
