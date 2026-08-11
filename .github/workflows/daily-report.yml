@@ -13,12 +13,19 @@ name: Daily TA Report
 # lets `report` proceed if it's really within a few minutes of 07:00 or
 # 13:30 Pacific. On any given day, exactly one of the four triggers passes
 # the gate; the other three are a no-op (gate job only, seconds of cost).
+#
+# Triggers are offset 7 minutes past each target rather than sitting on
+# the hour/half-hour: GitHub's own docs warn that `schedule` runs are
+# delayed most at the top of every hour (the most common cron time, so
+# the busiest queue), and a same-day trigger sitting exactly on :00/:30
+# went unfired for over an hour on 2026-08-11. The 15-min gate tolerance
+# below easily absorbs a 7-min offset.
 on:
   schedule:
-    - cron: '0 14 * * 1-5'   # 07:00 PDT (roughly mid-Mar to early Nov)
-    - cron: '0 15 * * 1-5'   # 07:00 PST (roughly early Nov to mid-Mar)
-    - cron: '30 20 * * 1-5'  # 13:30 PDT
-    - cron: '30 21 * * 1-5'  # 13:30 PST
+    - cron: '7 14 * * 1-5'   # 07:07 PDT (roughly mid-Mar to early Nov)
+    - cron: '7 15 * * 1-5'   # 07:07 PST (roughly early Nov to mid-Mar)
+    - cron: '37 20 * * 1-5'  # 13:37 PDT
+    - cron: '37 21 * * 1-5'  # 13:37 PST
   workflow_dispatch: {}
 
 jobs:
