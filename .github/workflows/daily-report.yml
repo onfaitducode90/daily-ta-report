@@ -1,0 +1,48 @@
+name: Daily TA Report
+
+# Runs report generation on GitHub's servers instead of a local machine, so
+# a local internet/power outage can never produce an "OFFLINE MODE" report
+# again. Cron below is UTC and does not auto-adjust for US DST -- these
+# times target ET during EDT (UTC-4, roughly mid-March to early November);
+# shift each entry by one hour during EST (winter) if you want the same
+# wall-clock ET times, or leave as-is and let the auto morning/intraday/
+# evening detection in get_run_mode() absorb the drift (it will occasionally
+# mislabel a run within about an hour of the 09:30/16:00 ET boundaries
+# during the EST months).
+on:
+  schedule:
+    - cron: '0 11 * * 1-5'   # ~07:00 ET -- morning
+    - cron: '30 16 * * 1-5'  # ~12:30 ET -- intraday
+    - cron: '30 20 * * 1-5'  # ~16:30 ET -- evening
+  workflow_dispatch: {}
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Drive token from secret
+        env:
+          DRIVE_TOKEN_JSON: ${{ secrets.DRIVE_TOKEN_JSON }}
+        run: |
+          mkdir -p logs
+          printf '%s' "$DRIVE_TOKEN_JSON" > logs/drive_token.json
+
+      - name: Restore persistent state from Drive
+        run: python state_sync.py --restore
+
+      - name: Generate report
+        run: python daily_ta_report.py
+
+      - name: Persist state back to Drive
+        if: always()
+        run: python state_sync.py --persist

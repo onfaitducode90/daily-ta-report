@@ -117,6 +117,59 @@ def find_file(session, filename, folder_id=None):
     return files[0]["id"] if files else None
 
 
+def find_folder(session, name, parent_id):
+    """Same idea as find_file, but scoped to folders via mimeType -- kept
+    separate rather than reusing find_file so a same-named regular file
+    can never be mistaken for the folder callers actually want."""
+    query = (f"'{_escape(parent_id)}' in parents and name = '{_escape(name)}' "
+             f"and mimeType = 'application/vnd.google-apps.folder' and trashed = false")
+    try:
+        resp = session.get(_FILES_URL, params={"q": query, "fields": "files(id,name)"},
+                            timeout=REQUEST_TIMEOUT_SECONDS)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise DriveError(f"Drive folder lookup failed for {name}: {e}") from e
+    files = resp.json().get("files", [])
+    return files[0]["id"] if files else None
+
+
+def create_folder(session, name, parent_id):
+    metadata = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
+    try:
+        resp = session.post(_FILES_URL, json=metadata, timeout=REQUEST_TIMEOUT_SECONDS)
+        resp.raise_for_status()
+        return resp.json()["id"]
+    except requests.exceptions.RequestException as e:
+        raise DriveError(f"Drive folder creation failed for {name}: {e}") from e
+
+
+def find_or_create_folder(session, name, parent_id):
+    return find_folder(session, name, parent_id) or create_folder(session, name, parent_id)
+
+
+def list_files(session, folder_id):
+    """Non-trashed files directly inside folder_id, as a list of
+    {"id", "name"} dicts."""
+    query = f"'{_escape(folder_id)}' in parents and trashed = false"
+    try:
+        resp = session.get(_FILES_URL, params={"q": query, "fields": "files(id,name)"},
+                            timeout=REQUEST_TIMEOUT_SECONDS)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise DriveError(f"Drive folder listing failed: {e}") from e
+    return resp.json().get("files", [])
+
+
+def download_file(session, file_id):
+    try:
+        resp = session.get(f"{_FILES_URL}/{file_id}", params={"alt": "media"},
+                            timeout=REQUEST_TIMEOUT_SECONDS)
+        resp.raise_for_status()
+        return resp.content
+    except requests.exceptions.RequestException as e:
+        raise DriveError(f"Drive download failed for file {file_id}: {e}") from e
+
+
 def upload_or_update(session, filename, content_bytes, mime_type="text/plain", folder_id=None):
     """Finds an existing file by name and updates its content in place, or
     creates a new one if none exists. Returns the Drive file ID either
