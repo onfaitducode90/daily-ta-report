@@ -2,22 +2,51 @@ name: Daily TA Report
 
 # Runs report generation on GitHub's servers instead of a local machine, so
 # a local internet/power outage can never produce an "OFFLINE MODE" report
-# again. Cron below is UTC and does not auto-adjust for US DST -- these
-# times target ET during EDT (UTC-4, roughly mid-March to early November);
-# shift each entry by one hour during EST (winter) if you want the same
-# wall-clock ET times, or leave as-is and let the auto morning/intraday/
-# evening detection in get_run_mode() absorb the drift (it will occasionally
-# mislabel a run within about an hour of the 09:30/16:00 ET boundaries
-# during the EST months).
+# again.
+#
+# Target wall-clock times are 07:00 and 13:30 America/Los_Angeles (Pacific),
+# year-round -- but GitHub Actions cron is plain UTC with no DST awareness,
+# so a single fixed UTC offset would drift by an hour every spring/fall.
+# Fixed by scheduling BOTH the PDT- and PST-equivalent UTC time for each
+# target (4 triggers/weekday total), then the `gate` job below checks the
+# actual current Pacific time via zoneinfo (which is DST-correct) and only
+# lets `report` proceed if it's really within a few minutes of 07:00 or
+# 13:30 Pacific. On any given day, exactly one of the four triggers passes
+# the gate; the other three are a no-op (gate job only, seconds of cost).
 on:
   schedule:
-    - cron: '0 11 * * 1-5'   # ~07:00 ET -- morning
-    - cron: '30 16 * * 1-5'  # ~12:30 ET -- intraday
-    - cron: '30 20 * * 1-5'  # ~16:30 ET -- evening
+    - cron: '0 14 * * 1-5'   # 07:00 PDT (roughly mid-Mar to early Nov)
+    - cron: '0 15 * * 1-5'   # 07:00 PST (roughly early Nov to mid-Mar)
+    - cron: '30 20 * * 1-5'  # 13:30 PDT
+    - cron: '30 21 * * 1-5'  # 13:30 PST
   workflow_dispatch: {}
 
 jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Check Pacific wall-clock target
+        id: check
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          now = datetime.now(ZoneInfo("America/Los_Angeles"))
+          targets = [(7, 0), (13, 30)]
+          minutes_now = now.hour * 60 + now.minute
+          # 15 min tolerance -- GitHub's own docs note scheduled runs can be
+          # delayed under load, and this stays well clear of the ~60 min gap
+          # to the OTHER (wrong-DST) cron trigger's target.
+          close = any(abs(minutes_now - (h * 60 + m)) <= 15 for h, m in targets)
+          print(f"should_run={'true' if close else 'false'}")
+          EOF
+
   report:
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
