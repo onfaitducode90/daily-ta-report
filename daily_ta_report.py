@@ -33,6 +33,17 @@ import calibrate
 import option_chain
 import iv_history
 import fill_tracker
+import market_data_cache
+
+try:
+    # Optional: only needed for the Drive-sync step at the end of main().
+    # A missing/broken google-auth install must degrade to "sync skipped",
+    # never take report generation down with it -- the local .txt file is
+    # the durable source of truth regardless of whether this import works.
+    import report_sync
+except Exception as e:
+    report_sync = None
+    _REPORT_SYNC_IMPORT_ERROR = e
 
 # Horizon (in trading bars) that pattern confidence is calibrated against
 # for display purposes -- see calibrate.py. An arbitrary but fixed choice;
@@ -46,8 +57,8 @@ try:
 except Exception:
     ET = None
 
-WATCHLIST = ["NVDA", "SPCX", "INTC"]
-MARKET_CONTEXT_TICKERS = ["SPY", "QQQ"]
+WATCHLIST = ["NVDA", "SPCX", "INTC", "SPY", "GLD", "SLV"]
+MARKET_CONTEXT_TICKERS = ["QQQ"]
 ALL_TICKERS = MARKET_CONTEXT_TICKERS + WATCHLIST
 HISTORY_DAYS = 300
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -337,6 +348,64 @@ def fetch_next_earnings_date(ticker):
         return future.index.min().date()
     except Exception:
         return None
+
+
+def get_history_cached(ticker, days=HISTORY_DAYS):
+    """Cache-through wrapper around fetch_history: try the live fetch,
+    write through to the local cache on success, and fall back to the
+    last cached snapshot on failure. Returns (df, source, as_of_date)
+    where source is "live", "cached", or "unavailable" (no live data and
+    nothing cached yet -- e.g. first-ever run on this machine with no
+    connection). fetch_history itself is untouched and still a pure live
+    fetch, so this is the only place that needs to know caching exists."""
+    df = fetch_history(ticker, days)
+    if df is not None:
+        market_data_cache.save_history(ticker, df)
+        return df, "live", df.index[-1].date()
+    cached_df, as_of = market_data_cache.load_history(ticker)
+    if cached_df is not None:
+        return cached_df, "cached", as_of
+    return None, "unavailable", None
+
+
+def get_vix_cached():
+    """Cache-through wrapper around fetch_vix. Returns (value, timestamp,
+    is_stale, source). A cached VIX read is always treated as stale --
+    "stale" already means "don't treat this as live" here, and a cached
+    reading (by definition no live connection at all) always qualifies,
+    regardless of how the >15-minute clock compares."""
+    value, timestamp, is_stale = fetch_vix()
+    if value is not None:
+        market_data_cache.save_vix(value, timestamp)
+        return value, timestamp, is_stale, "live"
+    cached_value, cached_ts = market_data_cache.load_vix()
+    if cached_value is not None:
+        return cached_value, cached_ts, True, "cached"
+    return None, None, None, "unavailable"
+
+
+def get_earnings_date_cached(ticker, report_date):
+    """Cache-through wrapper around fetch_next_earnings_date. Returns
+    (earnings_date, source)."""
+    earnings_date = fetch_next_earnings_date(ticker)
+    if earnings_date is not None:
+        _, cached_dividend = market_data_cache.load_calendar(ticker, report_date)
+        market_data_cache.save_calendar(ticker, earnings_date, cached_dividend)
+        return earnings_date, "live"
+    cached_earnings, _ = market_data_cache.load_calendar(ticker, report_date)
+    return (cached_earnings, "cached") if cached_earnings is not None else (None, "unavailable")
+
+
+def get_dividend_date_cached(ticker, report_date):
+    """Cache-through wrapper around fetch_next_dividend_date. Returns
+    (dividend_date, source)."""
+    dividend_date = fetch_next_dividend_date(ticker)
+    if dividend_date is not None:
+        cached_earnings, _ = market_data_cache.load_calendar(ticker, report_date)
+        market_data_cache.save_calendar(ticker, cached_earnings, dividend_date)
+        return dividend_date, "live"
+    _, cached_dividend = market_data_cache.load_calendar(ticker, report_date)
+    return (cached_dividend, "cached") if cached_dividend is not None else (None, "unavailable")
 
 
 def fetch_next_dividend_date(ticker):
@@ -1450,7 +1519,7 @@ def next_fomc_date(today):
 
 
 def build_market_context_section(vix_value, vix_timestamp, vix_is_stale, spy_trend_line,
-                                  qqq_trend_line, report_date=None):
+                                  qqq_trend_line, report_date=None, vix_source="live"):
     lines = []
     if vix_value is not None:
         if vix_value < 15:
@@ -1461,11 +1530,20 @@ def build_market_context_section(vix_value, vix_timestamp, vix_is_stale, spy_tre
             regime = "Elevated volatility — premium selling favored"
         else:
             regime = "Crisis volatility — reduce size, be cautious"
-        stale_bit = " [STALE — >15 min old, treat as last known, not live]" if vix_is_stale else ""
+        # "cached" (no live connection at all this run) and "stale" (a live
+        # connection, but the quote itself was already >15 min old -- e.g.
+        # a pre-market run) are different failure modes worth distinguishing
+        # rather than collapsing into one flag.
+        if vix_source == "cached":
+            stale_bit = " [OFFLINE — no live connection, showing last known VIX]"
+        elif vix_is_stale:
+            stale_bit = " [STALE — >15 min old, treat as last known, not live]"
+        else:
+            stale_bit = ""
         ts_bit = f" (as of {vix_timestamp.strftime('%Y-%m-%d %H:%M %Z')})" if vix_timestamp is not None else ""
         lines.append(f"VIX: {vix_value:.1f} — {regime}{stale_bit}{ts_bit}")
     else:
-        lines.append("VIX: N/A — data unavailable")
+        lines.append("VIX: N/A — live fetch failed and no cached VIX reading is available")
     lines.append(spy_trend_line)
     lines.append(qqq_trend_line)
 
@@ -1730,20 +1808,33 @@ def compute_confluence(df, pattern_matches):
     }
 
 
-def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=None):
+def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=None,
+                    data_source="live", data_as_of=None):
     """Build the full multi-section report text for a single watchlist
     ticker. Returns (report_text, portfolio_info) -- portfolio_info is a
     dict of the facts the PORTFOLIO VIEW section (built once, after every
     ticker has been analyzed) needs to aggregate across the watchlist, or
-    None if this ticker couldn't be analyzed at all."""
+    None if this ticker couldn't be analyzed at all.
+
+    data_source is "live", "cached", or "unavailable" (see
+    get_history_cached) -- "cached" means live market data couldn't be
+    reached this run and this section is built entirely from the last
+    successful fetch, which callers must be told plainly rather than have
+    it look indistinguishable from a live read."""
     lines = []
     lines.append("=" * 60)
     lines.append(f"{ticker}")
     lines.append("=" * 60)
 
     if df is None or df.empty:
-        lines.append("WARNING: No data available for this ticker — skipping.")
+        lines.append("WARNING: No data available for this ticker -- live fetch failed and "
+                      "no cached data exists yet for it either. Run this report once with "
+                      "an internet connection to seed local data for offline runs.")
         return "\n".join(lines), None
+
+    if data_source == "cached":
+        lines.append(f"[OFFLINE -- live market data unavailable this run; every figure below "
+                      f"is from the last successful fetch, as of {data_as_of}]")
 
     min_days_required = 30
     has_min_data = len(df) >= min_days_required
@@ -1801,7 +1892,10 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
         lines.append("Weekly Trend: Insufficient data")
         lines.append("Market bias: Neutral")
 
-    beta_ctx = calc_beta_correlation(df, spy_df)
+    # SPY is the benchmark itself here -- regressing it against spy_df
+    # would just report beta=1.00/correlation=1.00 every time, which is
+    # true but tells you nothing, so skip the section entirely for it.
+    beta_ctx = calc_beta_correlation(df, spy_df) if ticker != "SPY" else None
     if beta_ctx is not None:
         beta, corr, se = beta_ctx["beta"], beta_ctx["correlation"], beta_ctx["beta_stderr"]
         ci_lo, ci_hi = beta - 1.96 * se, beta + 1.96 * se
@@ -1834,7 +1928,7 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
             lines.append(f"  Recent ({beta_ctx['recent_n']}d, faster-moving) beta: {beta_ctx['recent_beta']:+.2f}, "
                           f"correlation {beta_ctx['recent_correlation']:+.2f} -- a large gap from the figure "
                           "above would suggest a recent shift in how this name trades vs. the market.")
-    else:
+    elif ticker != "SPY":
         lines.append("vs SPY: Insufficient overlapping history (need 60+ days) to compute a beta/correlation read.")
 
     # ---------------- SECTION 3: Key Technical Zones ----------------
@@ -2432,7 +2526,7 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
     # the chain block below it printed verified strikes anyway -- advisory
     # text next to actionable strikes is the weaker half of "suppressed or
     # hard-flagged." This makes it suppressed.
-    earnings_date = fetch_next_earnings_date(ticker)
+    earnings_date, earnings_source = get_earnings_date_cached(ticker, report_date)
     days_to_earnings = (earnings_date - report_date).days if earnings_date is not None else None
     # The right test is whether earnings falls before the EXPIRATION being
     # traded, not a fixed 7-day window from today -- a 3rd audit noted
@@ -2534,12 +2628,14 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
                       "measures) does not. Premium-selling structures are suppressed until "
                       "after the event.")
     elif earnings_date is not None:
-        lines.append(f"Next earnings: {earnings_date}.")
+        cached_bit = " (cached -- live calendar unavailable)" if earnings_source == "cached" else ""
+        lines.append(f"Next earnings: {earnings_date}{cached_bit}.")
 
-    dividend_date = fetch_next_dividend_date(ticker)
+    dividend_date, dividend_source = get_dividend_date_cached(ticker, report_date)
     days_to_dividend = (dividend_date - report_date).days if dividend_date is not None else None
     if days_to_dividend is not None and 0 <= days_to_dividend <= 7:
-        lines.append(f"DIVIDEND WARNING: {ticker} goes ex-dividend on {dividend_date} "
+        cached_bit = " (cached -- live calendar unavailable)" if dividend_source == "cached" else ""
+        lines.append(f"DIVIDEND WARNING: {ticker} goes ex-dividend on {dividend_date}{cached_bit} "
                       f"({days_to_dividend} day{'s' if days_to_dividend != 1 else ''} away) -- a short "
                       "call carries early-assignment risk into this date if its extrinsic value drops "
                       "below the dividend. Check assignment risk before holding a short call through it.")
@@ -2803,21 +2899,32 @@ def main():
                     "the report will reflect the last available session.")
 
     data = {}
+    data_source = {}
     for ticker in ALL_TICKERS:
-        df = fetch_history(ticker)
-        if df is None:
-            safe_print(f"WARNING: No data available for {ticker} — it will be skipped in the report.")
+        df, source, as_of = get_history_cached(ticker)
+        if source == "unavailable":
+            safe_print(f"WARNING: No data available for {ticker} (live fetch failed, no cache) "
+                       "— it will be skipped in the report.")
+        elif source == "cached":
+            safe_print(f"NOTE: {ticker} — live fetch failed, using cached data as of {as_of}.")
         data[ticker] = df
+        data_source[ticker] = (source, as_of)
 
     # Stamp the report with the date of the most recent actual bar, not
     # blindly with "today" -- these differ on weekends/holidays, or if a
     # session's data hasn't posted yet, and a header claiming a date with no
-    # underlying bar is worse than an honest "as of" the last real one.
-    last_bar_dates = [df.index[-1].date() for df in data.values() if df is not None and not df.empty]
+    # underlying bar is worse than an honest "as of" the last real one. This
+    # now also covers a fully-offline run: report_date is still the real
+    # as-of date of whatever cached data is being used, not today's date
+    # dressed up as if it reflected a session that was never actually seen.
+    last_bar_dates = [as_of for _, as_of in data_source.values() if as_of is not None]
     report_date = max(last_bar_dates) if last_bar_dates else (
         now_et.date() if hasattr(now_et, "date") else date.today())
 
-    vix_value, vix_timestamp, vix_is_stale = fetch_vix()
+    any_cached = any(source == "cached" for source, _ in data_source.values())
+    any_unavailable = any(source == "unavailable" for source, _ in data_source.values())
+
+    vix_value, vix_timestamp, vix_is_stale, vix_source = get_vix_cached()
 
     spy_line = analyze_market_ticker("SPY", data.get("SPY"))
     qqq_line = analyze_market_ticker("QQQ", data.get("QQQ"))
@@ -2826,10 +2933,19 @@ def main():
     report_lines.append("=" * 40)
     report_lines.append("DAILY TECHNICAL ANALYSIS REPORT")
     report_lines.append(f"{report_date.strftime('%Y-%m-%d')} — {mode_label} Session")
+    if any_cached or any_unavailable:
+        report_lines.append("")
+        report_lines.append("*** OFFLINE MODE -- live market data could not be reached this run. ***")
+        if any_cached:
+            report_lines.append("Tickers marked [OFFLINE] below are built from the last successful "
+                                 "fetch, not live data -- check the as-of date on each.")
+        if any_unavailable:
+            stale_tickers = [t for t, (s, _) in data_source.items() if s == "unavailable"]
+            report_lines.append(f"No data at all (live or cached) for: {', '.join(stale_tickers)}.")
     report_lines.append("")
     report_lines.append("MARKET CONTEXT")
     for line in build_market_context_section(vix_value, vix_timestamp, vix_is_stale, spy_line, qqq_line,
-                                              report_date=report_date):
+                                              report_date=report_date, vix_source=vix_source):
         report_lines.append(line)
     report_lines.append("=" * 40)
     report_lines.append("")
@@ -2837,8 +2953,9 @@ def main():
     portfolio_infos = []
     for ticker in WATCHLIST:
         df = data.get(ticker)
+        ticker_source, ticker_as_of = data_source.get(ticker, ("unavailable", None))
         premarket_data = None
-        if mode == "morning" and df is not None:
+        if mode == "morning" and df is not None and ticker_source == "live":
             premarket_data = fetch_premarket(ticker)
         # A 2nd audit found analyze_ticker unguarded here: one bad quote in
         # one local chain file (or any other single-ticker failure) raised
@@ -2848,7 +2965,8 @@ def main():
         # found, but this is the backstop for whatever wasn't found.
         try:
             section, portfolio_info = analyze_ticker(ticker, df, mode, report_date, premarket_data,
-                                                       spy_df=data.get("SPY"))
+                                                       spy_df=data.get("SPY"),
+                                                       data_source=ticker_source, data_as_of=ticker_as_of)
         except Exception as e:
             safe_print(f"WARNING: {ticker} failed to analyze ({e}) -- skipping it, "
                        "continuing with the rest of the report.")
@@ -2885,6 +3003,22 @@ def main():
         sys.exit(1)
 
     print(f"Report saved to {filepath}")
+
+    # Best-effort Drive sync. This must never affect the exit status or
+    # hold up report generation -- the file above is already saved and
+    # is the durable copy regardless of whether this step succeeds. A
+    # separate Task Scheduler job (`report_sync.py --flush`) also retries
+    # anything that fails here, independent of when the next report runs.
+    if report_sync is not None:
+        try:
+            overall_source = "cached" if any_cached else "live"
+            report_sync.enqueue(filepath, report_date, mode, overall_source)
+            report_sync.flush_queue()
+        except Exception as e:
+            safe_print(f"WARNING: Report sync step failed ({e}) -- report was still saved locally.")
+    else:
+        safe_print(f"NOTE: Report sync unavailable (google-auth import failed: "
+                    f"{_REPORT_SYNC_IMPORT_ERROR}) -- report was still saved locally.")
 
 
 if __name__ == "__main__":

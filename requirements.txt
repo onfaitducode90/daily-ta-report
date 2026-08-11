@@ -8,3 +8,11 @@ pandas==3.0.3
 numpy==2.4.6
 scipy==1.18.0
 scikit-learn==1.9.0
+
+# Direct dependencies of drive_client.py's Drive sync step (report_sync.py).
+# requests was already an implicit transitive dependency of yfinance; now
+# that drive_client.py imports it directly, it's pinned here rather than
+# left to ride along on whatever version yfinance happens to pull in.
+requests==2.34.2
+google-auth==2.55.0
+google-auth-oauthlib==1.4.0
