@@ -4,23 +4,32 @@ Real ATM-IV history log (G27, 2nd Opus audit).
 
 fetch_real_iv_context (daily_ta_report.py) reads real ATM IV from
 whatever local ThinkorSwim chain snapshot happens to be available, but
-has never had a real IV-RANK to offer -- calc_iv_rank only ever built a
-percentile from realized vol (HV), because no history of actual IV
-readings was being kept anywhere. This module closes that gap: every
-report run that resolves a real_iv_context appends that day's ATM IV to
-a small local CSV log, idempotent per (ticker, date), so that once enough
-daily snapshots accumulate a GENUINE IV-rank percentile can be computed
-from real implied volatility instead of a realized-vol proxy.
+has never had a real IV-RANK or IV-PERCENTILE to offer -- calc_iv_rank
+only ever built a percentile from realized vol (HV), because no history
+of actual IV readings was being kept anywhere. This module closes that
+gap: every report run that resolves a real_iv_context appends that day's
+ATM IV to a small local CSV log, idempotent per (ticker, date), so that
+once enough daily snapshots accumulate, two GENUINE metrics can be
+computed from real implied volatility instead of a realized-vol proxy:
 
-This does not retire the HV-based fallback -- with only a handful of
-snapshots logged so far, there isn't remotely enough history to trust a
-percentile from real_iv_rank() yet (see MIN_SAMPLES_FOR_RANK), and this
-module says so plainly rather than reporting a number built on too little
-data. Once FULL_LOOKBACK samples exist for a ticker, real_iv_rank()
-becomes a real ~1-year IV-rank read; until then it returns None and
-callers must keep using the existing proxy, exactly the same pattern
-prediction_log.py/calibrate.py already use for pattern-confidence
-calibration.
+  - real_iv_percentile(): % of lookback days with IV below today's --
+    the industry-standard "IV Percentile" formula.
+  - real_iv_rank(): (current - low) / (high - low) * 100 over the
+    lookback window -- the industry-standard "IV Rank" formula (what ToS
+    and most platforms mean by plain "IV Rank"). Different platforms
+    conflate these two under one name or the other; this module keeps
+    them as two distinct functions with two distinct formulas so the
+    report can label each correctly.
+
+This does not retire the HV-based fallback (calc_iv_rank in
+daily_ta_report.py) -- with only a handful of snapshots logged so far,
+there isn't remotely enough history to trust either real metric yet (see
+MIN_SAMPLES_FOR_RANK), and this module says so plainly rather than
+reporting a number built on too little data. Once FULL_LOOKBACK samples
+exist for a ticker, both functions become real ~1-year reads; until then
+they return None and callers must keep using the existing HV proxy,
+exactly the same pattern prediction_log.py/calibrate.py already use for
+pattern-confidence calibration.
 
 Writing here must never break report generation: every write is wrapped
 and failures are printed as warnings, not raised (same rule as
@@ -88,51 +97,74 @@ def log_iv(ticker, report_date, iv, expiration, dte, snapshot_date):
         print(f"WARNING: IV history log write failed: {e}")
 
 
-def real_iv_rank(ticker, current_iv, lookback=FULL_LOOKBACK):
-    """Percentile rank of `current_iv` among this ticker's last `lookback`
-    logged real-IV readings (current_iv itself included, matching
-    calc_iv_rank's convention). Returns (percentile, n_samples) --
-    percentile is None if fewer than MIN_SAMPLES_FOR_RANK readings exist,
-    so callers never present a rank built on too little history as if it
-    were a real one.
+def _lookback_values(ticker, lookback):
+    """Shared history lookup for both metrics below: this ticker's last
+    `lookback` logged real-IV readings as floats, skipping unparseable
+    rows (a blank/corrupt `iv` cell from a partially-written row) rather
+    than raising -- this feeds into report generation on every run and
+    must never take it down. Returns (values, n)."""
+    rows = [r for r in _read_all() if r.get("ticker") == ticker]
+    rows.sort(key=lambda r: r["date"])
+    rows = rows[-lookback:]
+    values = []
+    for r in rows:
+        try:
+            values.append(float(r["iv"]))
+        except (TypeError, ValueError, KeyError):
+            continue
+    return values, len(values)
 
-    Naming note (3rd audit): this is scipy's percentileofscore -- "what
-    fraction of past readings were at or below today's" -- not the
-    alternate (current-min)/(max-min)*100 formula some options platforms
-    also call "IV Rank". Kept as `_rank` rather than renamed to
-    `_percentile` to match calc_iv_rank (daily_ta_report.py), which
-    computes the same percentileofscore formula for the HV-based proxy
-    this function is meant to eventually replace -- two different names
-    for the same methodology would be more confusing than one name used
-    consistently, even though "percentile" is arguably the more precise
-    term for what's actually computed.
 
-    Wrapped end-to-end and skips unparseable rows rather than raising --
-    this is called from analyze_ticker on every report run (unlike
-    log_iv, it wasn't wrapped before this fix), and the module's own rule
-    is that nothing here may break report generation. A single blank/
+def real_iv_percentile(ticker, current_iv, lookback=FULL_LOOKBACK):
+    """IV Percentile: the fraction of this ticker's last `lookback` logged
+    real-IV readings (current_iv itself included, so a fresh reading
+    against just itself scores 0%, not undefined) that sit STRICTLY BELOW
+    current_iv, as a 0-100 percentage. This is the industry-standard IV
+    Percentile formula -- distinct from IV Rank (see real_iv_rank below),
+    even though some platforms sloppily use "IV Rank" for either one.
 
-    Wrapped end-to-end and skips unparseable rows rather than raising --
-    this is called from analyze_ticker on every report run (unlike
-    log_iv, it wasn't wrapped before this fix), and the module's own rule
-    is that nothing here may break report generation. A single blank/
-    corrupt `iv` cell in the CSV (e.g. from a partially-written row) must
-    not take the whole report down with it."""
+    Returns (percentile, n_samples). percentile is None if fewer than
+    MIN_SAMPLES_FOR_RANK readings exist, so callers never present a
+    percentile built on too little history as if it were a real one.
+    Wrapped end-to-end, never raises -- same rule as the rest of this
+    module."""
     try:
-        rows = [r for r in _read_all() if r.get("ticker") == ticker]
-        rows.sort(key=lambda r: r["date"])
-        rows = rows[-lookback:]
-        values = []
-        for r in rows:
-            try:
-                values.append(float(r["iv"]))
-            except (TypeError, ValueError, KeyError):
-                continue
-        n = len(values)
+        values, n = _lookback_values(ticker, lookback)
         if n < MIN_SAMPLES_FOR_RANK:
             return None, n
         from scipy import stats as scipy_stats
-        return float(scipy_stats.percentileofscore(values, current_iv)), n
+        # kind="strict": % of values < current_iv, matching "days where
+        # historical IV was BELOW current IV" exactly (a tie doesn't count
+        # as "below").
+        pct = float(scipy_stats.percentileofscore(values, current_iv, kind="strict"))
+        return pct, n
+    except Exception as e:
+        print(f"WARNING: IV history percentile lookup failed: {e}")
+        return None, 0
+
+
+def real_iv_rank(ticker, current_iv, lookback=FULL_LOOKBACK):
+    """IV Rank: where current_iv sits between this ticker's lookback-window
+    IV low and high, min-max normalized to 0-100 --
+    (current - low) / (high - low) * 100. This is what ToS and most
+    options platforms mean by plain "IV Rank" -- distinct from IV
+    Percentile above, which uses a different formula and will generally
+    read a different number even from the exact same history.
+
+    Returns (rank, n_samples). rank is None if fewer than
+    MIN_SAMPLES_FOR_RANK readings exist. If every logged reading in the
+    window is identical (high == low), returns 0.0 rather than dividing
+    by zero -- matching ToS's own `if hi != lo then rank else 0` guard.
+    Wrapped end-to-end, never raises -- same rule as the rest of this
+    module."""
+    try:
+        values, n = _lookback_values(ticker, lookback)
+        if n < MIN_SAMPLES_FOR_RANK:
+            return None, n
+        lo, hi = min(values), max(values)
+        if hi == lo:
+            return 0.0, n
+        return float((current_iv - lo) / (hi - lo) * 100), n
     except Exception as e:
         print(f"WARNING: IV history rank lookup failed: {e}")
         return None, 0
