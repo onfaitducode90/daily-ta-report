@@ -76,7 +76,12 @@ jobs:
       - name: Restore persistent state from Drive
         run: python state_sync.py --restore
 
+      - name: Restore option chain data from Drive
+        run: python optionchain_sync.py --restore
+
       - name: Generate report
+        env:
+          TA_OPTION_CHAIN_DIR: ${{ github.workspace }}/optionchain
         run: python daily_ta_report.py
 
       - name: Persist state back to Drive
