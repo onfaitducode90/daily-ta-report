@@ -4,73 +4,34 @@ name: Daily TA Report
 # a local internet/power outage can never produce an "OFFLINE MODE" report
 # again.
 #
-# Target wall-clock times are 07:00 and 13:30 America/Los_Angeles (Pacific),
-# year-round -- but GitHub Actions cron is plain UTC with no DST awareness,
-# so a single fixed UTC offset would drift by an hour every spring/fall.
-# Fixed by scheduling BOTH the PDT- and PST-equivalent UTC time for each
-# target (4 triggers/weekday total), then the `gate` job below checks the
-# actual current Pacific time via zoneinfo (which is DST-correct) and only
-# lets `report` proceed if it's really within a few minutes of 07:00 or
-# 13:30 Pacific. On any given day, exactly one of the four triggers passes
-# the gate; the other three are a no-op (gate job only, seconds of cost).
+# No target wall-clock time and no gate job: the exact time of day the
+# report runs doesn't matter (daily_ta_report.py's own get_run_mode()
+# labels the report morning/intraday/evening from whatever time it
+# actually runs, so there's nothing for this workflow to get right or
+# wrong about timing). What matters is that a report gets generated once
+# per weekday, cloud-only, without depending on this machine being on or
+# online.
 #
-# Triggers are offset 7 minutes past each target rather than sitting on
-# the hour/half-hour: GitHub's own docs warn that `schedule` runs are
-# delayed most at the top of every hour (the most common cron time, so
-# the busiest queue), and a same-day trigger sitting exactly on :00/:30
-# went unfired for over an hour on 2026-08-11. The 15-min gate tolerance
-# below easily absorbs a 7-min offset.
-#
-# Each target also gets two extra triggers a few minutes later (+10, +13)
-# rather than just one at +7. GitHub's `schedule` event is best-effort and
-# can be silently DROPPED, not just delayed -- on 2026-08-12 the single
-# +7 trigger never fired at all (no run of any kind appears in the
-# history), so no report was generated that morning. Three independent
-# cron evaluations per target, all still inside the 15-min gate window,
-# make an all-three-dropped morning much less likely without adding any
-# real cost: a skipped trigger only runs the ~5s `gate` job.
+# GitHub's `schedule` trigger for this (public) repo has proven unreliable
+# on both axes that matter here:
+#   - Delayed: every schedule-triggered run so far has fired 2-4 hours
+#     late (verified 2026-08-12 -- see git history for the investigation).
+#   - Dropped: a single trigger went completely unfired on 2026-08-11.
+# Three triggers 15 minutes apart, all pointed at the same rough target,
+# make an all-three-dropped day unlikely without adding real cost -- this
+# repo is public, so Actions minutes are unlimited, and the report/Drive
+# upload is idempotent by (date, mode) filename, so if more than one of
+# the three actually fires, the later one just overwrites the same file
+# rather than creating a duplicate.
 on:
   schedule:
-    - cron: '7 14 * * 1-5'    # 07:07 PDT (roughly mid-Mar to early Nov)
-    - cron: '10 14 * * 1-5'   # 07:10 PDT
-    - cron: '13 14 * * 1-5'   # 07:13 PDT
-    - cron: '7 15 * * 1-5'    # 07:07 PST (roughly early Nov to mid-Mar)
-    - cron: '10 15 * * 1-5'   # 07:10 PST
-    - cron: '13 15 * * 1-5'   # 07:13 PST
-    - cron: '37 20 * * 1-5'   # 13:37 PDT
-    - cron: '40 20 * * 1-5'   # 13:40 PDT
-    - cron: '43 20 * * 1-5'   # 13:43 PDT
-    - cron: '37 21 * * 1-5'   # 13:37 PST
-    - cron: '40 21 * * 1-5'   # 13:40 PST
-    - cron: '43 21 * * 1-5'   # 13:43 PST
+    - cron: '7 14 * * 1-5'
+    - cron: '22 14 * * 1-5'
+    - cron: '37 14 * * 1-5'
   workflow_dispatch: {}
 
 jobs:
-  gate:
-    runs-on: ubuntu-latest
-    outputs:
-      should_run: ${{ steps.check.outputs.should_run }}
-    steps:
-      - name: Check Pacific wall-clock target
-        id: check
-        run: |
-          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
-          from datetime import datetime
-          from zoneinfo import ZoneInfo
-
-          now = datetime.now(ZoneInfo("America/Los_Angeles"))
-          targets = [(7, 0), (13, 30)]
-          minutes_now = now.hour * 60 + now.minute
-          # 15 min tolerance -- GitHub's own docs note scheduled runs can be
-          # delayed under load, and this stays well clear of the ~60 min gap
-          # to the OTHER (wrong-DST) cron trigger's target.
-          close = any(abs(minutes_now - (h * 60 + m)) <= 15 for h, m in targets)
-          print(f"should_run={'true' if close else 'false'}")
-          EOF
-
   report:
-    needs: gate
-    if: needs.gate.outputs.should_run == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
