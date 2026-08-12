@@ -54,8 +54,10 @@ CALIBRATION_HORIZON = 10
 try:
     from zoneinfo import ZoneInfo
     ET = ZoneInfo("America/New_York")
+    PT = ZoneInfo("America/Los_Angeles")
 except Exception:
     ET = None
+    PT = None
 
 WATCHLIST = ["NVDA", "SPCX", "INTC", "SPY", "GLD", "SLV"]
 MARKET_CONTEXT_TICKERS = ["QQQ"]
@@ -2909,6 +2911,17 @@ def main():
     mode, now_et, is_trading_day = get_run_mode()
     mode_label = mode.capitalize()
 
+    # Report header shows the actual clock time the analysis ran, in
+    # Pacific time, rather than a morning/intraday/evening label -- the
+    # report can now run at any time of day (see the GitHub Actions
+    # workflow), so a fixed session label is no longer meaningful, and the
+    # real run time is more useful than a guess at which "session" it was.
+    if PT is not None and now_et.tzinfo is not None:
+        now_pt = now_et.astimezone(PT)
+        time_label = now_pt.strftime("%I:%M %p PST")
+    else:
+        time_label = "time unavailable"
+
     safe_print(f"Fetching data — run mode: {mode}")
     if not is_trading_day:
         safe_print(f"NOTE: {now_et.date()} is not a trading day (weekend/holiday) — "
@@ -2948,7 +2961,7 @@ def main():
     report_lines = []
     report_lines.append("=" * 40)
     report_lines.append("DAILY TECHNICAL ANALYSIS REPORT")
-    report_lines.append(f"{report_date.strftime('%Y-%m-%d')} — {mode_label} Session")
+    report_lines.append(f"{report_date.strftime('%Y-%m-%d')} — Analysis run at {time_label}")
     if any_cached or any_unavailable:
         report_lines.append("")
         report_lines.append("*** OFFLINE MODE -- live market data could not be reached this run. ***")
