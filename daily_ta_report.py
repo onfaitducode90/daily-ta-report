@@ -3130,7 +3130,16 @@ def main():
     report_lines.append("=" * 40)
     report_lines.append("")
 
+    # Portfolio View needs every ticker's portfolio_info, which only
+    # exists once analyze_ticker has actually run for that ticker -- so
+    # the per-ticker analysis loop still has to run first. What moves is
+    # only where the resulting TEXT lands in the final report: ticker
+    # sections are collected here rather than appended straight to
+    # report_lines, so Portfolio View can be written into report_lines
+    # BEFORE them, putting the cross-watchlist summary at the top of the
+    # report instead of after every individual ticker section.
     portfolio_infos = []
+    ticker_sections = []
     for ticker in WATCHLIST:
         df = data.get(ticker)
         ticker_source, ticker_as_of = data_source.get(ticker, ("unavailable", None))
@@ -3154,8 +3163,7 @@ def main():
                        f"ERROR: analysis failed for this ticker ({e}) -- see console/logs. "
                        "Every other ticker in this report is unaffected.")
             portfolio_info = None
-        report_lines.append(section)
-        report_lines.append("")
+        ticker_sections.append(section)
         portfolio_infos.append(portfolio_info)
 
     report_lines.append("=" * 40)
@@ -3164,6 +3172,10 @@ def main():
         report_lines.append(line)
     report_lines.append("=" * 40)
     report_lines.append("")
+
+    for section in ticker_sections:
+        report_lines.append(section)
+        report_lines.append("")
 
     full_report = "\n".join(report_lines)
 
