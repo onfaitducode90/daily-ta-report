@@ -2001,8 +2001,17 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
         pd_high = pd_low = pd_close = None
         lines.append("Prior day levels: Insufficient data")
 
-    if len(df) >= 5:
-        last5 = df.tail(5)
+    # "Prior week"/"prior month" must exclude today's own bar, the same
+    # way "prior day" (df.iloc[-2]) already does -- df.tail(5)/tail(21)
+    # was including the CURRENT session, so on 2026-08-12 "Prior week
+    # high" silently showed 2026-08-12's own intraday high (verified live:
+    # tail(5) spanned 08-06 through 08-12 and its max was today's high,
+    # not any actually-prior day's), which also fed a fabricated
+    # "resistance" candidate into the support/resistance model that was
+    # really just today's own high. df.iloc[:-1] drops today's bar before
+    # taking the trailing window, so both are now genuinely prior periods.
+    if len(df) >= 6:
+        last5 = df.iloc[:-1].tail(5)
         pw_high, pw_low = float(last5["High"].max()), float(last5["Low"].min())
         lines.append(f"Prior week high: {fmt_price(pw_high)} ({fmt_pct((current_price - pw_high) / pw_high * 100)})")
         lines.append(f"Prior week low: {fmt_price(pw_low)} ({fmt_pct((current_price - pw_low) / pw_low * 100)})")
@@ -2014,8 +2023,8 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
     # week's Monday) -- new reference levels, feeding the support/
     # resistance model below alongside the existing prior-day/prior-week/
     # 52-week ones.
-    if len(df) >= 21:
-        last21 = df.tail(21)
+    if len(df) >= 22:
+        last21 = df.iloc[:-1].tail(21)
         pm_high, pm_low = float(last21["High"].max()), float(last21["Low"].min())
     else:
         pm_high = pm_low = None
