@@ -2024,14 +2024,18 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
         pw_high = pw_low = None
         lines.append("Prior week high/low: Insufficient data")
 
-    # Prior month (~21 trading days, still a rolling window -- only
-    # "prior week" was reported as calendar-misaligned) and current week
-    # (bars since this week's Monday) -- reference levels feeding the
-    # support/resistance model below alongside prior-day/prior-week/
-    # 52-week.
-    if len(df) >= 22:
-        last21 = df.iloc[:-1].tail(21)
-        pm_high, pm_low = float(last21["High"].max()), float(last21["Low"].min())
+    # Prior month: same calendar-boundary fix as prior week, same reason
+    # -- a rolling 21-trading-day window still overlapped the current
+    # month on every day but the 1st. Anchored to the fully completed
+    # calendar month before this one (1st of last month through the day
+    # before the 1st of this month), zero overlap with the current
+    # month's bars regardless of what day of the month the report runs.
+    current_month_start = last_date.replace(day=1)
+    prior_month_end = current_month_start - timedelta(days=1)
+    prior_month_start = prior_month_end.replace(day=1)
+    prior_month_df = df[(df.index >= prior_month_start) & (df.index <= prior_month_end)]
+    if not prior_month_df.empty:
+        pm_high, pm_low = float(prior_month_df["High"].max()), float(prior_month_df["Low"].min())
     else:
         pm_high = pm_low = None
 

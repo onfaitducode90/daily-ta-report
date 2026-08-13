@@ -105,10 +105,59 @@ def test_prior_week_on_a_monday_still_excludes_todays_own_bar():
           high_line is not None and "110.00" in high_line)
 
 
+def test_prior_month_excludes_a_more_extreme_current_month():
+    """Same fix, same reason, one level up: prior month must be the fully
+    completed calendar month before this one. No "Prior month" report
+    line exists (it only feeds the support/resistance model), so this
+    checks the fabricated current-month extreme doesn't leak into the
+    report ANYWHERE -- a stronger, path-agnostic check than grepping one
+    specific line, and robust to however the S/R model clusters things.
+
+    Today is deliberately late in the month (the 26th, a Wednesday) so
+    there's a clean stretch of "current month, but not also prior-week/
+    prior-day/current-week" trading days (Aug 3-16) to plant the fabricated
+    extreme on, without it also being expected to show up in those OTHER
+    date-windowed fields for unrelated, legitimate reasons."""
+    today = pd.Timestamp("2026-08-26")  # a Wednesday, late in the month
+    check("Sanity: test date is actually a Wednesday", today.day_name() == "Wednesday")
+    df = _make_df(today, n=150, base=200.0)
+
+    last_month_mask = (df.index >= "2026-07-01") & (df.index <= "2026-07-31")
+    df.loc[last_month_mask, "High"] = 210.0
+    df.loc[last_month_mask, "Low"] = 192.0
+
+    # Aug 3-16: current month, but outside prior-week (17-23)/prior-day
+    # (25)/current-week (24-26) -- isolated enough that only "prior month"
+    # logic could possibly pick this up.
+    early_aug_mask = (df.index >= "2026-08-03") & (df.index <= "2026-08-16")
+    df.loc[early_aug_mask, "High"] = 1999.0
+    df.loc[early_aug_mask, "Low"] = 2.0
+
+    spy_df = _make_df(today, n=150, base=400.0)
+    text, _ = R.analyze_ticker("TEST", df, "intraday", today.date(), spy_df=spy_df,
+                                data_source="live", data_as_of=today.date())
+
+    # Checking for the bare string "1999.00" anywhere would be too broad:
+    # 52-week high/low is a DIFFERENT, intentionally-inclusive rolling
+    # window (it's supposed to reflect the whole trailing year including
+    # recent data), so it correctly picks up the fabricated spike too --
+    # that's not a leak, that's 52-week high doing its actual job. The
+    # thing that must specifically NOT happen is the "prior-month" label
+    # attaching to the fabricated value.
+    check('Fabricated high is not labeled "prior-month" evidence anywhere',
+          "prior-month @ 1999.00" not in text)
+    check('Fabricated low is not labeled "prior-month" evidence anywhere',
+          "prior-month @ 2.00" not in text)
+    # Positive checks too, not just absence -- prove prior-month evidence
+    # actually surfaces with July's true values, not just that it's silent.
+    check("prior-month evidence shows July's true high, 210.00", "prior-month @ 210.00" in text)
+    check("prior-month evidence shows July's true low, 192.00", "prior-month @ 192.00" in text)
+
+
 def main():
     test_prior_week_excludes_a_more_extreme_current_week_on_a_midweek_run()
     test_prior_week_on_a_monday_still_excludes_todays_own_bar()
-
+    test_prior_month_excludes_a_more_extreme_current_month()
     passed = sum(1 for _, ok in RESULTS if ok)
     total = len(RESULTS)
     print(f"\n{passed}/{total} checks passed")
