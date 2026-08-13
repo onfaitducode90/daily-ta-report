@@ -34,6 +34,7 @@ import option_chain
 import iv_history
 import fill_tracker
 import market_data_cache
+import support_resistance
 
 try:
     # Optional: only needed for the Drive-sync step at the end of main().
@@ -1044,27 +1045,27 @@ def calc_rolling_vwap(df, window=5):
     return float(vwap)
 
 
-def calc_volume_poc(df, window=20, atr_val=None, bins=None):
-    """Volume point-of-control. Each bar's volume is distributed
-    PROPORTIONALLY across every bin its High-Low range overlaps (assuming
-    volume is spread uniformly across the bar's range -- still an
-    approximation with daily bars, since we don't have intraday
-    volume-at-price, but a real distribution rather than the previous
-    behavior of dumping 100% of a bar's volume into whichever single bin
-    happened to contain its typical price).
+def _volume_histogram(sub, atr_val=None, bins=None):
+    """Shared bin-building core for calc_volume_poc and calc_volume_nodes:
+    each bar's volume is distributed PROPORTIONALLY across every bin its
+    High-Low range overlaps (assuming volume is spread uniformly across
+    the bar's range -- still an approximation with daily bars, since we
+    don't have intraday volume-at-price, but a real distribution rather
+    than dumping 100% of a bar's volume into whichever single bin happens
+    to contain its typical price).
 
-    Bin count is sized so each bin is roughly 0.3 ATR wide when `atr_val` is
-    given -- finer bins just chase daily noise, coarser ones wash out any
-    real concentration. Falls back to a fixed 20 bins if no ATR is
-    available. An explicit `bins` always overrides both."""
-    sub = df.tail(window)
+    Bin count is sized so each bin is roughly 0.3 ATR wide when `atr_val`
+    is given -- finer bins just chase daily noise, coarser ones wash out
+    any real concentration. Falls back to a fixed 20 bins if no ATR is
+    available. An explicit `bins` always overrides both. Returns
+    (bin_edges, bin_volumes), or (None, None) if there's no usable range."""
     if sub.empty:
-        return None
+        return None, None
     price_min = sub["Low"].min()
     price_max = sub["High"].max()
     price_range = price_max - price_min
     if price_range <= 0:
-        return float(price_max)
+        return None, None
 
     if bins is None:
         if atr_val is not None and atr_val > 0:
@@ -1087,9 +1088,55 @@ def calc_volume_poc(df, window=20, atr_val=None, bins=None):
         overlap = np.clip(overlap_hi - overlap_lo, 0, None)
         bin_volumes += (overlap / (high - low)) * vol
 
+    return bin_edges, bin_volumes
+
+
+def calc_volume_poc(df, window=20, atr_val=None, bins=None):
+    """Volume point-of-control: the single highest-volume bin's midpoint.
+    See _volume_histogram for how volume is distributed across bins."""
+    sub = df.tail(window)
+    bin_edges, bin_volumes = _volume_histogram(sub, atr_val, bins)
+    if bin_edges is None:
+        return float(sub["High"].max()) if not sub.empty else None
+
     max_bin = int(np.argmax(bin_volumes))
     poc = (bin_edges[max_bin] + bin_edges[max_bin + 1]) / 2
     return float(poc)
+
+
+def calc_volume_nodes(df, window=60, atr_val=None, bins=None, max_nodes=5):
+    """Multiple High Volume Nodes (local-maximum bins in the same volume
+    histogram calc_volume_poc uses), not just the single global POC --
+    support/resistance wants every meaningful volume concentration, not
+    only the strongest one. Returns a list of (price, relative_weight)
+    sorted by weight descending, where relative_weight is each node's
+    volume as a fraction of the strongest node's (so the true POC is
+    always 1.0 and secondary nodes score proportionally lower). A bin
+    only counts as a node if it's a local peak (more volume than both
+    immediate neighbors) -- otherwise a wide, smoothly-varying
+    concentration would report one node per bin instead of one per
+    genuine peak."""
+    sub = df.tail(window)
+    bin_edges, bin_volumes = _volume_histogram(sub, atr_val, bins)
+    if bin_edges is None:
+        return []
+
+    n = len(bin_volumes)
+    peak_idxs = [i for i in range(n)
+                 if bin_volumes[i] > 0
+                 and (i == 0 or bin_volumes[i] >= bin_volumes[i - 1])
+                 and (i == n - 1 or bin_volumes[i] >= bin_volumes[i + 1])]
+    if not peak_idxs:
+        return []
+
+    max_vol = max(bin_volumes[i] for i in peak_idxs)
+    if max_vol <= 0:
+        return []
+
+    nodes = [((bin_edges[i] + bin_edges[i + 1]) / 2, float(bin_volumes[i] / max_vol))
+             for i in peak_idxs]
+    nodes.sort(key=lambda t: -t[1])
+    return nodes[:max_nodes]
 
 
 def calc_intraday_poc_bins(intraday_df, min_bins=20, max_bins=40):
@@ -1865,14 +1912,21 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
     # ---------------- SECTION 2: Market Structure ----------------
     lines.append("")
     lines.append("--- MARKET STRUCTURE ---")
+    # Daily/weekly swing highs/lows are captured here (rather than
+    # discarded, as before) so the new support/resistance model below can
+    # reuse the EXACT SAME swing points as this trend-structure read --
+    # S/R and trend structure can then never silently disagree about
+    # where a swing point actually is.
+    daily_swing_highs, daily_swing_lows = [], []
+    weekly_swing_highs, weekly_swing_lows = [], []
     if has_min_data:
-        trend, detail, _, _ = classify_structure(
+        trend, detail, daily_swing_highs, daily_swing_lows = classify_structure(
             df, lookback_bars=min(60, len(df)), swing_lookback=3)
         lines.append(f"Daily swing structure (60 days): {trend} — {detail}")
 
         weekly_df = resample_weekly(df)
         if len(weekly_df) >= 15:
-            weekly_trend_disp, weekly_detail, _, _ = classify_structure(
+            weekly_trend_disp, weekly_detail, weekly_swing_highs, weekly_swing_lows = classify_structure(
                 weekly_df, lookback_bars=min(60, len(weekly_df)), swing_lookback=2)
             weekly_partial_bit = (" (most recent weekly bar is still forming)"
                                    if weekly_df.index[-1].date() > df.index[-1].date() else "")
@@ -1956,6 +2010,24 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
         pw_high = pw_low = None
         lines.append("Prior week high/low: Insufficient data")
 
+    # Prior month (~21 trading days) and current week (bars since this
+    # week's Monday) -- new reference levels, feeding the support/
+    # resistance model below alongside the existing prior-day/prior-week/
+    # 52-week ones.
+    if len(df) >= 21:
+        last21 = df.tail(21)
+        pm_high, pm_low = float(last21["High"].max()), float(last21["Low"].min())
+    else:
+        pm_high = pm_low = None
+
+    last_date = df.index[-1]
+    week_start = last_date - timedelta(days=last_date.weekday())
+    cur_week = df[df.index >= week_start]
+    if not cur_week.empty:
+        cw_high, cw_low = float(cur_week["High"].max()), float(cur_week["Low"].min())
+    else:
+        cw_high = cw_low = None
+
     # Moving averages
     sma200 = sma(df["Close"], 200)
     sma50 = sma(df["Close"], 50)
@@ -2024,6 +2096,7 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
     intraday_df = fetch_intraday_bars(ticker)
 
     # Rolling VWAP
+    vwap5 = None
     if len(df) >= 5:
         vwap5 = calc_rolling_vwap(df, window=5)
         lines.append(f"5-day VWAP (daily-bar approx): {fmt_price(vwap5)} — price "
@@ -2372,14 +2445,73 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
     date_str = report_date.strftime("%Y-%m-%d")
     lines.append(f"{ticker} — {date_str} {mode_label} Report:")
 
-    nearest_support = None
-    nearest_resistance = None
-    candidates_below = [v for v in [pd_low, pw_low, low52] if v is not None and v < current_price]
-    candidates_above = [v for v in [pd_high, pw_high, high52] if v is not None and v > current_price]
-    if candidates_below:
-        nearest_support = max(candidates_below)
-    if candidates_above:
-        nearest_resistance = min(candidates_above)
+    support_zones, resistance_zones = [], []
+    if atr_val is not None and has_min_data:
+        volume_nodes = calc_volume_nodes(df, window=min(60, len(df)), atr_val=atr_val)
+        pattern_targets = [(parse_price(pm.price_target), pm.name) for pm in pattern_matches
+                            if pm.price_target != "N/A"]
+        reference_levels = {
+            "prior-day high": pd_high, "prior-day low": pd_low,
+            "prior-week high": pw_high, "prior-week low": pw_low,
+            "prior-month high": pm_high, "prior-month low": pm_low,
+            "current-week high": cw_high, "current-week low": cw_low,
+            "52-week high": high52, "52-week low": low52,
+        }
+        sr_result = support_resistance.compute_levels(
+            df, current_price, atr_val,
+            daily_swing_highs, daily_swing_lows, weekly_swing_highs, weekly_swing_lows,
+            reference_levels, volume_nodes, vwap5, session_vwap, pattern_targets,
+        )
+        support_zones = sr_result["support"]
+        resistance_zones = sr_result["resistance"]
+
+    # Nearest (S1/R1) zone, if any, for the sentences below -- kept as a
+    # single representative price per side the way nearest_support/
+    # nearest_resistance used to work, but now backed by the full scored/
+    # clustered multi-source model rather than "whichever of 3 fixed
+    # references happens to be closest."
+    nearest_support = support_zones[0].price if support_zones else None
+    nearest_resistance = resistance_zones[0].price if resistance_zones else None
+
+    # ---------------- SECTION 6b: Support / Resistance ----------------
+    # Full diagnostic breakdown for every reported zone (S1-S3/R1-R3) --
+    # this is deliberately printed IN the report, not just kept
+    # internally, so the reasoning behind each zone (which sources
+    # agreed, how many times it's been tested, how strong the reaction
+    # was) is visible rather than the report just asserting a number.
+    lines.append("")
+    lines.append("--- SUPPORT / RESISTANCE ---")
+    if not support_zones and not resistance_zones:
+        lines.append("Support/Resistance: Insufficient data")
+    else:
+        for i, z in enumerate(resistance_zones, start=1):
+            zone_str = fmt_price(z.price) if abs(z.zone_high - z.zone_low) < 0.01 else \
+                f"{fmt_price(z.zone_low)}-{fmt_price(z.zone_high)}"
+            lines.append(f"R{i}: {zone_str}  (strength {z.strength_score:.1f}, relevance {z.relevance_score:.1f}, "
+                         f"{z.distance_pct:+.2f}% away, {z.number_of_tests} test(s), "
+                         f"confluence: {', '.join(z.confluence_factors)})")
+            lines.append(f"    Swing evidence: {'; '.join(z.evidence['swing_evidence']) or 'none'}")
+            lines.append(f"    Prior period evidence: {'; '.join(z.evidence['prior_period_evidence']) or 'none'}")
+            lines.append(f"    Volume evidence: {'; '.join(z.evidence['volume_evidence']) or 'none'}")
+            lines.append(f"    VWAP evidence: {'; '.join(z.evidence['vwap_evidence']) or 'none'}")
+            lines.append(f"    Gap evidence: {'; '.join(z.evidence['gap_evidence']) or 'none'}")
+            lines.append(f"    Pattern evidence: {'; '.join(z.evidence['pattern_evidence']) or 'none'}")
+            lines.append(f"    Reaction strength: {z.evidence['reaction_strength_atr']:.2f} ATR avg, "
+                         f"confluence count: {z.evidence['confluence_count']}")
+        for i, z in enumerate(support_zones, start=1):
+            zone_str = fmt_price(z.price) if abs(z.zone_high - z.zone_low) < 0.01 else \
+                f"{fmt_price(z.zone_low)}-{fmt_price(z.zone_high)}"
+            lines.append(f"S{i}: {zone_str}  (strength {z.strength_score:.1f}, relevance {z.relevance_score:.1f}, "
+                         f"{z.distance_pct:+.2f}% away, {z.number_of_tests} test(s), "
+                         f"confluence: {', '.join(z.confluence_factors)})")
+            lines.append(f"    Swing evidence: {'; '.join(z.evidence['swing_evidence']) or 'none'}")
+            lines.append(f"    Prior period evidence: {'; '.join(z.evidence['prior_period_evidence']) or 'none'}")
+            lines.append(f"    Volume evidence: {'; '.join(z.evidence['volume_evidence']) or 'none'}")
+            lines.append(f"    VWAP evidence: {'; '.join(z.evidence['vwap_evidence']) or 'none'}")
+            lines.append(f"    Gap evidence: {'; '.join(z.evidence['gap_evidence']) or 'none'}")
+            lines.append(f"    Pattern evidence: {'; '.join(z.evidence['pattern_evidence']) or 'none'}")
+            lines.append(f"    Reaction strength: {z.evidence['reaction_strength_atr']:.2f} ATR avg, "
+                         f"confluence count: {z.evidence['confluence_count']}")
 
     # Confluence numbers come from compute_confluence (see its docstring) --
     # a self-contained function shared with the historical backtest, so
@@ -2434,13 +2566,23 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
         lines.append("Structure: range-bound — no clean higher-timeframe trend to lean on, "
                       "so treat the signals above as tactical, not structural.")
 
+    def _zone_phrase(zone):
+        """'6382-6388 zone, backed by a daily swing, prior-day low, and
+        volume confluence' -- names the actual sources instead of just
+        asserting a price, per the report's explainability goal."""
+        zone_str = (fmt_price(zone.price) if abs(zone.zone_high - zone.zone_low) < 0.01
+                    else f"{fmt_price(zone.zone_low)}-{fmt_price(zone.zone_high)}")
+        factors = ", ".join(zone.confluence_factors)
+        return f"{zone_str} zone, backed by {factors}"
+
     levels_sent = "Key levels: "
-    if nearest_support is not None and nearest_resistance is not None:
-        levels_sent += f"support near {fmt_price(nearest_support)}, resistance near {fmt_price(nearest_resistance)}."
-    elif nearest_support is not None:
-        levels_sent += f"support near {fmt_price(nearest_support)}; no clear resistance identified."
-    elif nearest_resistance is not None:
-        levels_sent += f"resistance near {fmt_price(nearest_resistance)}; no clear support identified."
+    if support_zones and resistance_zones:
+        levels_sent += (f"nearest meaningful support is the {_zone_phrase(support_zones[0])}; "
+                         f"resistance is the {_zone_phrase(resistance_zones[0])}.")
+    elif support_zones:
+        levels_sent += f"nearest meaningful support is the {_zone_phrase(support_zones[0])}; no clear resistance identified."
+    elif resistance_zones:
+        levels_sent += f"resistance is the {_zone_phrase(resistance_zones[0])}; no clear support identified."
     else:
         levels_sent += "insufficient data to identify key levels."
     lines.append(levels_sent)
@@ -2473,9 +2615,9 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
         watch_sent += f"confirmation of the {live_pattern.name} — a decisive close beyond its boundary."
     elif live_pattern and live_pattern.status == "Forming":
         watch_sent += f"follow-through on the {live_pattern.name} over the next session or two."
-    elif nearest_resistance is not None and nearest_support is not None:
-        watch_sent += (f"a close above {fmt_price(nearest_resistance)} to confirm strength, "
-                        f"or a break below {fmt_price(nearest_support)} to signal weakness.")
+    elif resistance_zones and support_zones:
+        watch_sent += (f"a close above {fmt_price(resistance_zones[0].zone_high)} to confirm strength, "
+                        f"or a break below {fmt_price(support_zones[0].zone_low)} to signal weakness.")
     else:
         watch_sent += "confirmation of the current structure via a decisive close through the nearest key level."
     lines.append(watch_sent)
