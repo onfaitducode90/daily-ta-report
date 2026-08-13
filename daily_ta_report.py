@@ -2001,36 +2001,40 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
         pd_high = pd_low = pd_close = None
         lines.append("Prior day levels: Insufficient data")
 
-    # "Prior week"/"prior month" must exclude today's own bar, the same
-    # way "prior day" (df.iloc[-2]) already does -- df.tail(5)/tail(21)
-    # was including the CURRENT session, so on 2026-08-12 "Prior week
-    # high" silently showed 2026-08-12's own intraday high (verified live:
-    # tail(5) spanned 08-06 through 08-12 and its max was today's high,
-    # not any actually-prior day's), which also fed a fabricated
-    # "resistance" candidate into the support/resistance model that was
-    # really just today's own high. df.iloc[:-1] drops today's bar before
-    # taking the trailing window, so both are now genuinely prior periods.
-    if len(df) >= 6:
-        last5 = df.iloc[:-1].tail(5)
-        pw_high, pw_low = float(last5["High"].max()), float(last5["Low"].min())
+    # "Prior week" must be the fully completed CALENDAR week before this
+    # one -- not a rolling N-trading-day window. A rolling 5-day window
+    # (the previous fix here) still leaked current-week bars into "prior
+    # week" any day other than Monday: e.g. on a Wednesday, the trailing
+    # 5 trading days are Thu/Fri (last week) + Mon/Tue/Wed (THIS week),
+    # so "prior week high/low" could actually be Wednesday's own numbers.
+    # Anchoring to calendar-week boundaries (Monday of this week, minus 7
+    # days for last week's Monday, through the Sunday before this week)
+    # guarantees zero overlap with the current week regardless of which
+    # weekday the report runs on.
+    last_date = df.index[-1]
+    week_start = last_date - timedelta(days=last_date.weekday())  # Monday of the CURRENT week
+    prior_week_start = week_start - timedelta(days=7)
+    prior_week_end = week_start - timedelta(days=1)  # Sunday immediately before the current week
+    prior_week_df = df[(df.index >= prior_week_start) & (df.index <= prior_week_end)]
+    if not prior_week_df.empty:
+        pw_high, pw_low = float(prior_week_df["High"].max()), float(prior_week_df["Low"].min())
         lines.append(f"Prior week high: {fmt_price(pw_high)} ({fmt_pct((current_price - pw_high) / pw_high * 100)})")
         lines.append(f"Prior week low: {fmt_price(pw_low)} ({fmt_pct((current_price - pw_low) / pw_low * 100)})")
     else:
         pw_high = pw_low = None
         lines.append("Prior week high/low: Insufficient data")
 
-    # Prior month (~21 trading days) and current week (bars since this
-    # week's Monday) -- new reference levels, feeding the support/
-    # resistance model below alongside the existing prior-day/prior-week/
-    # 52-week ones.
+    # Prior month (~21 trading days, still a rolling window -- only
+    # "prior week" was reported as calendar-misaligned) and current week
+    # (bars since this week's Monday) -- reference levels feeding the
+    # support/resistance model below alongside prior-day/prior-week/
+    # 52-week.
     if len(df) >= 22:
         last21 = df.iloc[:-1].tail(21)
         pm_high, pm_low = float(last21["High"].max()), float(last21["Low"].min())
     else:
         pm_high = pm_low = None
 
-    last_date = df.index[-1]
-    week_start = last_date - timedelta(days=last_date.weekday())
     cur_week = df[df.index >= week_start]
     if not cur_week.empty:
         cw_high, cw_low = float(cur_week["High"].max()), float(cur_week["Low"].min())
