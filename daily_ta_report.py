@@ -1868,7 +1868,7 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
     if has_min_data:
         trend, detail, _, _ = classify_structure(
             df, lookback_bars=min(60, len(df)), swing_lookback=3)
-        lines.append(f"Daily swing structure (60 bars): {trend} — {detail}")
+        lines.append(f"Daily swing structure (60 days): {trend} — {detail}")
 
         weekly_df = resample_weekly(df)
         if len(weekly_df) >= 15:
@@ -1876,7 +1876,7 @@ def analyze_ticker(ticker, df, mode, report_date, premarket_data=None, spy_df=No
                 weekly_df, lookback_bars=min(60, len(weekly_df)), swing_lookback=2)
             weekly_partial_bit = (" (most recent weekly bar is still forming)"
                                    if weekly_df.index[-1].date() > df.index[-1].date() else "")
-            lines.append(f"Weekly Trend (real higher timeframe): {weekly_trend_disp} — "
+            lines.append(f"Weekly Trend (last 60 weeks): {weekly_trend_disp} — "
                           f"{weekly_detail}{weekly_partial_bit}")
         else:
             lines.append("Weekly Trend: Insufficient data (need 15+ weekly bars)")
