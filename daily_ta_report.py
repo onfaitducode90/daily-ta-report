@@ -824,8 +824,15 @@ def find_swings(df, lookback=3):
     return swing_highs, swing_lows
 
 
-def classify_structure(df, lookback_bars=60, swing_lookback=3):
-    """Classify trend structure using swing highs/lows over the last N bars."""
+def classify_structure(df, lookback_bars=60, swing_lookback=3, min_step=0.0):
+    """Classify trend structure using swing highs/lows over the last N bars.
+
+    `min_step` is the minimum price difference between consecutive swing
+    points for them to count as higher/lower. At the default 0.0 a one-cent
+    difference qualifies (the long-standing behavior every per-ticker
+    caller still uses); the market-context line passes an ATR-scaled value
+    so a near-flat ceiling/floor (e.g. SPY's $775.30 -> $774.03 swing highs,
+    2026-09, 0.19 ATR apart) reads as RANGE rather than a lower high."""
     sub = df.tail(lookback_bars) if len(df) > lookback_bars else df
     if len(sub) < (swing_lookback * 2 + 1) * 3:
         # not much data, still try
@@ -839,10 +846,10 @@ def classify_structure(df, lookback_bars=60, swing_lookback=3):
     last_highs = [p for _, p in swing_highs[-3:]]
     last_lows = [p for _, p in swing_lows[-3:]]
 
-    highs_rising = all(last_highs[i] < last_highs[i + 1] for i in range(len(last_highs) - 1))
-    highs_falling = all(last_highs[i] > last_highs[i + 1] for i in range(len(last_highs) - 1))
-    lows_rising = all(last_lows[i] < last_lows[i + 1] for i in range(len(last_lows) - 1))
-    lows_falling = all(last_lows[i] > last_lows[i + 1] for i in range(len(last_lows) - 1))
+    highs_rising = all(last_highs[i + 1] - last_highs[i] > min_step for i in range(len(last_highs) - 1))
+    highs_falling = all(last_highs[i] - last_highs[i + 1] > min_step for i in range(len(last_highs) - 1))
+    lows_rising = all(last_lows[i + 1] - last_lows[i] > min_step for i in range(len(last_lows) - 1))
+    lows_falling = all(last_lows[i] - last_lows[i + 1] > min_step for i in range(len(last_lows) - 1))
 
     if highs_rising and lows_rising:
         return "UPTREND", "HH+HL structure confirmed", swing_highs, swing_lows
@@ -1618,8 +1625,47 @@ def analyze_market_ticker(ticker, df):
     """For SPY/QQQ market context — returns a one-line trend summary."""
     if df is None or len(df) < 20:
         return f"{ticker}: Insufficient data for structure analysis"
-    trend, detail, _, _ = classify_structure(df, lookback_bars=len(df), swing_lookback=3)
+    trend, detail = classify_market_trend(df)
     return f"{ticker}: {trend} — {detail}"
+
+
+MARKET_TREND_MIN_STEP_ATR = 0.5  # swing-to-swing step, in ATR(14) multiples
+MARKET_TREND_MIN_ADX = 20.0      # below this, ADX itself says "no trend"
+
+
+def classify_market_trend(df):
+    """UPTREND / DOWNTREND / RANGE for the SPY/QQQ market-context line.
+
+    Swing structure alone (classify_structure at min_step=0) labeled
+    sideways chop as a trend whenever the last three swings drifted the same
+    way by any amount -- e.g. SPY 2026-09-24 read DOWNTREND on a $1.27
+    lower high while ADX was 11.7 and price sat above a rising 50-day SMA.
+    A trend label here now needs all three to agree:
+      1. swing structure with every step >= 0.5 x ATR(14),
+      2. price on the matching side of the 50-day SMA,
+      3. ADX(14) >= 20.
+    Anything else is RANGE, with the detail naming the first failed check.
+    """
+    atr = calc_atr(df).iloc[-1]
+    min_step = MARKET_TREND_MIN_STEP_ATR * atr if pd.notna(atr) else 0.0
+    structure, detail, _, _ = classify_structure(
+        df, lookback_bars=len(df), swing_lookback=3, min_step=min_step)
+    if structure == "RANGE":
+        if detail == "Mixed swing structure" and pd.notna(atr):
+            detail = f"Mixed swing structure (swing steps under {MARKET_TREND_MIN_STEP_ATR:g} ATR count as flat)"
+        return "RANGE", detail
+
+    close = float(df["Close"].iloc[-1])
+    sma50 = sma(df["Close"], 50).iloc[-1]
+    adx = calc_adx(df)[0].iloc[-1]
+    up = structure == "UPTREND"
+    if pd.notna(sma50) and (close <= sma50 if up else close >= sma50):
+        return "RANGE", (f"{'HH+HL' if up else 'LH+LL'} swings but price is "
+                         f"{'below' if up else 'above'} the 50-day SMA ({fmt_price(float(sma50))})")
+    if pd.notna(adx) and adx < MARKET_TREND_MIN_ADX:
+        return "RANGE", (f"{'HH+HL' if up else 'LH+LL'} swings but ADX {adx:.1f} "
+                         f"< {MARKET_TREND_MIN_ADX:g} (no trend strength)")
+    return structure, f"{detail}, 50-day SMA and ADX {adx:.1f} agree"
 
 
 def collapse_family(label, family_signals, weight_cap, coverage_denominator=None):
